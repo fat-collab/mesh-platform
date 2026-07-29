@@ -1,0 +1,449 @@
+'use client';
+
+/**
+ * Fleet & Loaner Command Center — full loaner inventory with lifecycle actions.
+ *
+ * Metrics header (fleet size / available / rented / maintenance) plus a table
+ * of every unit with status, assignment, mileage, fuel, and Return / Maintenance
+ * / Assign actions. Shares the rental-db session store with the mobile intake
+ * wizard, so field loaner assignments show here on load.
+ */
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { clsx } from 'clsx';
+import {
+  addVehicle,
+  assignVehicle,
+  getFleet,
+  removeVehicle,
+  returnVehicle,
+  setVehicleStatus,
+} from '@/lib/rental-db';
+import type { RentalStatus, RentalVehicle } from '@/components/sales/types';
+
+const STATUS_TONE: Record<RentalStatus, string> = {
+  AVAILABLE: 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200',
+  RENTED: 'border-sky-500/40 bg-sky-500/15 text-sky-200',
+  MAINTENANCE: 'border-amber-500/40 bg-amber-500/15 text-amber-200',
+};
+
+export default function FleetPage() {
+  const [fleet, setFleet] = useState<RentalVehicle[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [assigningId, setAssigningId] = useState<string | null>(null);
+  const [assignCustomer, setAssignCustomer] = useState('');
+  const [assignAgent, setAssignAgent] = useState('');
+  const [assignMileage, setAssignMileage] = useState('');
+  // Add-vehicle form.
+  const [addOpen, setAddOpen] = useState(false);
+  const [addMakeModel, setAddMakeModel] = useState('');
+  const [addPlate, setAddPlate] = useState('');
+  const [addMileage, setAddMileage] = useState('');
+  const [addFuel, setAddFuel] = useState('100');
+
+  const refresh = useCallback(async () => {
+    try {
+      setFleet(await getFleet());
+      setError(null);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Data sync failed');
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        setError(null);
+        const rows = await getFleet();
+        if (cancelled) return;
+        setFleet(rows);
+      } catch (err: unknown) {
+        if (!cancelled) setError(err instanceof Error ? err.message : 'Data sync failed');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Refresh-safe: re-pull fleet when the tab/window regains focus so field
+  // assignments made in the intake wizard show up here.
+  useEffect(() => {
+    const onFocus = () => void refresh();
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onFocus);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onFocus);
+    };
+  }, [refresh]);
+
+  const metrics = useMemo(
+    () => ({
+      total: fleet.length,
+      available: fleet.filter((v) => v.currentStatus === 'AVAILABLE').length,
+      rented: fleet.filter((v) => v.currentStatus === 'RENTED').length,
+      maintenance: fleet.filter((v) => v.currentStatus === 'MAINTENANCE').length,
+    }),
+    [fleet],
+  );
+
+  const startAssign = (v: RentalVehicle) => {
+    setAssigningId(v.id);
+    setAssignCustomer('');
+    setAssignAgent('');
+    setAssignMileage(String(v.currentMileage));
+  };
+
+  const confirmAssign = async (v: RentalVehicle) => {
+    await assignVehicle(v.id, {
+      customerName: assignCustomer.trim() || 'Walk-in',
+      agentName: assignAgent.trim() || null,
+      startingMileage: parseInt(assignMileage, 10) || v.currentMileage,
+      fuelLevel: v.fuelLevel,
+    });
+    setAssigningId(null);
+    await refresh();
+  };
+
+  const doReturn = async (id: string) => {
+    await returnVehicle(id);
+    await refresh();
+  };
+  const setStatus = async (id: string, status: RentalStatus) => {
+    await setVehicleStatus(id, status);
+    await refresh();
+  };
+  const doRemove = async (id: string) => {
+    await removeVehicle(id);
+    await refresh();
+  };
+  const submitAddVehicle = async () => {
+    if (!addMakeModel.trim()) return;
+    await addVehicle({
+      makeModel: addMakeModel.trim(),
+      licensePlate: addPlate.trim(),
+      currentMileage: parseInt(addMileage, 10) || 0,
+      fuelLevel: parseInt(addFuel, 10) || 100,
+    });
+    setAddMakeModel('');
+    setAddPlate('');
+    setAddMileage('');
+    setAddFuel('100');
+    setAddOpen(false);
+    await refresh();
+  };
+
+  return (
+    <div className="min-h-full bg-zinc-950 text-zinc-100">
+      <div className="mx-auto max-w-[1600px] px-6 py-6">
+        <header className="mb-5 flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <h1 className="text-xl font-bold tracking-tight">Fleet &amp; Loaner Command Center</h1>
+            <p className="text-sm text-zinc-400">Loaner vehicle inventory &amp; return tracking</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setAddOpen((v) => !v)}
+            className="rounded-md bg-sky-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-sky-500"
+          >
+            + Add New Vehicle
+          </button>
+        </header>
+
+        {addOpen && (
+          <div className="mb-5 flex flex-wrap items-end gap-2 rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
+            <input
+              value={addMakeModel}
+              onChange={(e) => setAddMakeModel(e.target.value)}
+              placeholder="Make & Model *"
+              className="min-w-[12rem] flex-1 rounded-md border border-zinc-700 bg-zinc-950/70 px-2.5 py-1.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500/60 focus:outline-none"
+            />
+            <input
+              value={addPlate}
+              onChange={(e) => setAddPlate(e.target.value)}
+              placeholder="License plate"
+              className="w-36 rounded-md border border-zinc-700 bg-zinc-950/70 px-2.5 py-1.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500/60 focus:outline-none"
+            />
+            <input
+              value={addMileage}
+              onChange={(e) => setAddMileage(e.target.value)}
+              inputMode="numeric"
+              placeholder="Mileage"
+              className="w-28 rounded-md border border-zinc-700 bg-zinc-950/70 px-2.5 py-1.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500/60 focus:outline-none"
+            />
+            <input
+              value={addFuel}
+              onChange={(e) => setAddFuel(e.target.value)}
+              inputMode="numeric"
+              placeholder="Fuel %"
+              className="w-24 rounded-md border border-zinc-700 bg-zinc-950/70 px-2.5 py-1.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500/60 focus:outline-none"
+            />
+            <button
+              type="button"
+              onClick={() => void submitAddVehicle()}
+              className="rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-semibold text-white hover:bg-emerald-500"
+            >
+              Add
+            </button>
+          </div>
+        )}
+
+        {/* Metrics */}
+        <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <Metric label="Total Fleet" value={metrics.total} />
+          <Metric label="Available" value={metrics.available} tone="text-emerald-300" />
+          <Metric label="Rented Out" value={metrics.rented} tone="text-sky-300" />
+          <Metric label="In Maintenance" value={metrics.maintenance} tone="text-amber-300" />
+        </div>
+
+        {error ? (
+          <div className="p-4 bg-red-950/20 border border-red-500/30 rounded-lg text-red-400 text-sm">
+            ⚠️ Error loading fleet: {error}
+          </div>
+        ) : loading ? (
+          <div className="flex h-64 items-center justify-center text-sm text-zinc-500">
+            Loading fleet…
+          </div>
+        ) : (
+          <div className="overflow-x-auto rounded-lg border border-zinc-800">
+            <table className="w-full min-w-[900px] text-left text-sm">
+              <thead className="border-b border-zinc-800 bg-zinc-900/60 text-[11px] uppercase tracking-wider text-zinc-500">
+                <tr>
+                  <th className="px-3 py-2 font-mono">Unit / Vehicle</th>
+                  <th className="px-3 py-2 font-mono">Plate</th>
+                  <th className="px-3 py-2 font-mono">Status</th>
+                  <th className="px-3 py-2 font-mono">Assigned</th>
+                  <th className="px-3 py-2 font-mono">Mileage</th>
+                  <th className="px-3 py-2 font-mono">Fuel</th>
+                  <th className="px-3 py-2 font-mono">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {fleet.map((v) => (
+                  <FleetRow
+                    key={v.id}
+                    v={v}
+                    assigning={assigningId === v.id}
+                    assignCustomer={assignCustomer}
+                    assignAgent={assignAgent}
+                    assignMileage={assignMileage}
+                    onAssignCustomer={setAssignCustomer}
+                    onAssignAgent={setAssignAgent}
+                    onAssignMileage={setAssignMileage}
+                    onStartAssign={() => startAssign(v)}
+                    onCancelAssign={() => setAssigningId(null)}
+                    onConfirmAssign={() => void confirmAssign(v)}
+                    onReturn={() => void doReturn(v.id)}
+                    onMaintenance={() => void setStatus(v.id, 'MAINTENANCE')}
+                    onAvailable={() => void setStatus(v.id, 'AVAILABLE')}
+                    onRemove={() => void doRemove(v.id)}
+                  />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Metric({ label, value, tone }: { label: string; value: number; tone?: string }) {
+  return (
+    <div className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-4">
+      <p className="font-mono text-[11px] uppercase tracking-wider text-zinc-500">{label}</p>
+      <p className={clsx('mt-1 text-2xl font-bold tabular-nums', tone ?? 'text-zinc-100')}>
+        {value}
+      </p>
+    </div>
+  );
+}
+
+interface FleetRowProps {
+  v: RentalVehicle;
+  assigning: boolean;
+  assignCustomer: string;
+  assignAgent: string;
+  assignMileage: string;
+  onAssignCustomer: (v: string) => void;
+  onAssignAgent: (v: string) => void;
+  onAssignMileage: (v: string) => void;
+  onStartAssign: () => void;
+  onCancelAssign: () => void;
+  onConfirmAssign: () => void;
+  onReturn: () => void;
+  onMaintenance: () => void;
+  onAvailable: () => void;
+  onRemove: () => void;
+}
+
+function FleetRow({
+  v,
+  assigning,
+  assignCustomer,
+  assignAgent,
+  assignMileage,
+  onAssignCustomer,
+  onAssignAgent,
+  onAssignMileage,
+  onStartAssign,
+  onCancelAssign,
+  onConfirmAssign,
+  onReturn,
+  onMaintenance,
+  onAvailable,
+  onRemove,
+}: FleetRowProps) {
+  const btn =
+    'rounded border px-2 py-0.5 text-[11px] font-medium transition-colors';
+  return (
+    <>
+      <tr className="border-b border-zinc-800/60">
+        <td className="px-3 py-2">
+          <div className="font-medium text-zinc-100">{v.makeModel}</div>
+          <div className="font-mono text-[11px] text-zinc-500">{v.id}</div>
+        </td>
+        <td className="px-3 py-2 font-mono text-xs text-zinc-300">{v.licensePlate}</td>
+        <td className="px-3 py-2">
+          <span
+            className={clsx(
+              'inline-flex items-center rounded-md border px-1.5 py-0.5 text-[11px] font-semibold',
+              STATUS_TONE[v.currentStatus],
+            )}
+          >
+            {v.currentStatus}
+          </span>
+        </td>
+        <td className="px-3 py-2 text-xs text-zinc-300">
+          {v.assignedCustomer ? (
+            <>
+              {v.assignedCustomer}
+              {v.assignedAgent && (
+                <span className="block text-[10px] text-sky-300">
+                  agent: {v.assignedAgent}
+                </span>
+              )}
+              {v.assignedLeadId && (
+                <span className="block font-mono text-[10px] text-zinc-500">
+                  {v.assignedLeadId}
+                </span>
+              )}
+              {v.expectedReturnDate && (
+                <span className="block text-[10px] text-amber-300">
+                  due {v.expectedReturnDate}
+                </span>
+              )}
+            </>
+          ) : (
+            <span className="text-zinc-600">—</span>
+          )}
+        </td>
+        <td className="px-3 py-2 text-xs tabular-nums text-zinc-300">
+          {v.startingMileage != null && v.startingMileage !== v.currentMileage ? (
+            <>
+              {v.startingMileage.toLocaleString()} →{' '}
+              {v.currentMileage.toLocaleString()}
+            </>
+          ) : (
+            v.currentMileage.toLocaleString()
+          )}
+        </td>
+        <td className="px-3 py-2 text-xs tabular-nums text-zinc-300">{v.fuelLevel}%</td>
+        <td className="px-3 py-2">
+          <div className="flex flex-wrap gap-1.5">
+            {v.currentStatus === 'RENTED' && (
+              <button
+                type="button"
+                onClick={onReturn}
+                className={clsx(btn, 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20')}
+              >
+                Check-In / Return
+              </button>
+            )}
+            {v.currentStatus === 'AVAILABLE' && !assigning && (
+              <button
+                type="button"
+                onClick={onStartAssign}
+                className={clsx(btn, 'border-sky-500/40 bg-sky-500/10 text-sky-300 hover:bg-sky-500/20')}
+              >
+                Assign
+              </button>
+            )}
+            {v.currentStatus === 'MAINTENANCE' ? (
+              <button
+                type="button"
+                onClick={onAvailable}
+                className={clsx(btn, 'border-zinc-700 bg-zinc-800/60 text-zinc-200 hover:bg-zinc-800')}
+              >
+                Mark Available
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={onMaintenance}
+                className={clsx(btn, 'border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20')}
+              >
+                Mark Maintenance
+              </button>
+            )}
+            {v.currentStatus !== 'RENTED' && (
+              <button
+                type="button"
+                onClick={onRemove}
+                className={clsx(btn, 'border-red-500/40 bg-red-500/10 text-red-300 hover:bg-red-500/20')}
+              >
+                Retire
+              </button>
+            )}
+          </div>
+        </td>
+      </tr>
+      {assigning && (
+        <tr className="border-b border-zinc-800/60 bg-zinc-950/40">
+          <td colSpan={7} className="px-3 py-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[11px] text-zinc-500">Assign {v.id} to:</span>
+              <input
+                value={assignCustomer}
+                onChange={(e) => onAssignCustomer(e.target.value)}
+                placeholder="Customer name"
+                className="rounded-md border border-zinc-700 bg-zinc-950/70 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500/60 focus:outline-none"
+              />
+              <input
+                value={assignAgent}
+                onChange={(e) => onAssignAgent(e.target.value)}
+                placeholder="Sales agent / rep"
+                className="rounded-md border border-zinc-700 bg-zinc-950/70 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500/60 focus:outline-none"
+              />
+              <input
+                value={assignMileage}
+                onChange={(e) => onAssignMileage(e.target.value)}
+                inputMode="numeric"
+                placeholder="Starting mileage"
+                className="w-32 rounded-md border border-zinc-700 bg-zinc-950/70 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500/60 focus:outline-none"
+              />
+              <button
+                type="button"
+                onClick={onConfirmAssign}
+                className="rounded-md bg-sky-600 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-sky-500"
+              >
+                Confirm
+              </button>
+              <button
+                type="button"
+                onClick={onCancelAssign}
+                className="rounded-md border border-zinc-700 px-2.5 py-1 text-[11px] text-zinc-300 hover:bg-zinc-800"
+              >
+                Cancel
+              </button>
+            </div>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}

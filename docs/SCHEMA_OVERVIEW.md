@@ -43,7 +43,7 @@ All carry `created_at` / `updated_at` (a `set_updated_at` trigger touches
 
 | Table | Key columns |
 |---|---|
-| `organizations` | id, name |
+| `organizations` | id, name, setup_completed, shop_email, shop_phone, tax_id, tos_accepted_at, tos_version, tos_accepted_ip |
 | `locations` | id, organization_id, name, address |
 | `users` | id, auth_user_id, organization_id, role, full_name, email |
 | `vehicles` | id, vin, make, model, year, paint_code |

@@ -6,6 +6,7 @@
  */
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { getSupabaseBrowserClient } from '@/lib/supabase';
 
 const DEST = '/dashboard/ops';
@@ -171,6 +172,13 @@ export default function LoginPage() {
             ))}
           </div>
         </div>
+
+        <p className="mt-5 text-center text-sm text-zinc-500">
+          New shop?{' '}
+          <Link href="/register" className="font-medium text-sky-400 hover:text-sky-300">
+            Create an account
+          </Link>
+        </p>
       </div>
     </div>
   );

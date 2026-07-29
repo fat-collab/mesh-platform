@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { isHoldStage, riskTone, type BoardOrder } from '@/lib/board';
 import type { Database, RoStage } from '@/lib/database.types';
+import type { RealtimePostgresChangesPayload } from '@supabase/supabase-js';
 import { getSupabaseBrowserClient } from '@/lib/supabase';
 import { fetchBoardOrders, persistStage, persistUnlock, persistRepairOrder } from '@/lib/ops-data';
 import { validateStageTransition } from '@/lib/stage-gates';
@@ -125,7 +126,7 @@ export default function OpsCockpitPage() {
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'repair_orders' },
-        (payload) => {
+        (payload: RealtimePostgresChangesPayload<RepairOrderRow>) => {
           setOrders((prev) => {
             switch (payload.eventType) {
               case 'INSERT':

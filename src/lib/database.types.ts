@@ -61,18 +61,39 @@ export interface Database {
         Row: {
           id: string;
           name: string;
+          tos_accepted_at: string | null;
+          tos_version: string | null;
+          tos_accepted_ip: string | null;
+          setup_completed: boolean;
+          shop_email: string | null;
+          shop_phone: string | null;
+          tax_id: string | null;
           created_at: string;
           updated_at: string;
         };
         Insert: {
           id?: string;
           name: string;
+          tos_accepted_at?: string | null;
+          tos_version?: string | null;
+          tos_accepted_ip?: string | null;
+          setup_completed?: boolean;
+          shop_email?: string | null;
+          shop_phone?: string | null;
+          tax_id?: string | null;
           created_at?: string;
           updated_at?: string;
         };
         Update: {
           id?: string;
           name?: string;
+          tos_accepted_at?: string | null;
+          tos_version?: string | null;
+          tos_accepted_ip?: string | null;
+          setup_completed?: boolean;
+          shop_email?: string | null;
+          shop_phone?: string | null;
+          tax_id?: string | null;
           created_at?: string;
           updated_at?: string;
         };

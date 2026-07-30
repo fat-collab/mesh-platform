@@ -1,16 +1,20 @@
 /**
  * PATCH /api/v1/organizations/setup
  *
- * Completes the onboarding gateway (/dashboard/setup): saves shop contact
- * details and records click-wrap acceptance of the MESH Terms of Service
- * (version, timestamp, accepting IP), then marks the organization
- * setup_completed.
+ * Completes the onboarding gateway (/dashboard/setup): saves/confirms shop
+ * details, then marks the organization setup_completed.
+ *
+ * Terms-of-Service click-wrap acceptance is NOT recorded here — the Legal
+ * Shield UI has moved upstream to registration (Phase 1 refactor). This route
+ * deliberately no longer writes tos_accepted_at/tos_version/tos_accepted_ip,
+ * since doing so with no consent UI on this page would fabricate a compliance
+ * record for something the user never actually saw/accepted at this step.
  *
  * Runs as the caller's own session (Bearer token) rather than the service
  * role — `organizations_update` RLS already restricts this to the org's own
  * EXECUTIVE, which is exactly who should be completing setup.
  *
- * Body: { shopPhone, shopEmail, taxId }
+ * Body: { shopName, shopPhone, shopEmail, taxId }
  * Header: Authorization: Bearer <access_token>
  * 200: { success: true }
  * 400: { success: false, error }   (validation)
@@ -25,19 +29,12 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const TOS_VERSION = 'v1.0-2026';
 
 interface SetupBody {
+  shopName?: string;
   shopPhone?: string;
   shopEmail?: string;
   taxId?: string;
-}
-
-/** Best-effort client IP from standard proxy headers. */
-function resolveClientIp(request: Request): string {
-  const forwardedFor = request.headers.get('x-forwarded-for');
-  if (forwardedFor) return forwardedFor.split(',')[0]?.trim() || 'unknown';
-  return request.headers.get('x-real-ip') || 'unknown';
 }
 
 export async function PATCH(request: Request): Promise<Response> {
@@ -53,10 +50,14 @@ export async function PATCH(request: Request): Promise<Response> {
     return NextResponse.json({ success: false, error: 'Invalid JSON body.' }, { status: 400 });
   }
 
+  const shopName = body.shopName?.trim() ?? '';
   const shopPhone = body.shopPhone?.trim() ?? '';
   const shopEmail = body.shopEmail?.trim().toLowerCase() ?? '';
   const taxId = body.taxId?.trim() ?? '';
 
+  if (!shopName) {
+    return NextResponse.json({ success: false, error: 'Shop name is required.' }, { status: 400 });
+  }
   if (!shopPhone) {
     return NextResponse.json({ success: false, error: 'Shop phone is required.' }, { status: 400 });
   }
@@ -84,12 +85,10 @@ export async function PATCH(request: Request): Promise<Response> {
     const { data, error } = await supabase
       .from('organizations')
       .update({
+        name: shopName,
         shop_phone: shopPhone,
         shop_email: shopEmail,
         tax_id: taxId,
-        tos_accepted_at: new Date().toISOString(),
-        tos_version: TOS_VERSION,
-        tos_accepted_ip: resolveClientIp(request),
         setup_completed: true,
       })
       .eq('id', profile.organizationId)

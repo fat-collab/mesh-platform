@@ -6,6 +6,7 @@
  * of parts-db.ts.
  */
 import { getSupabaseBrowserClient } from './supabase';
+import { isUuid } from './is-uuid';
 import { executeDBOperation } from './db-guard';
 import type {
   CommChannel,
@@ -91,6 +92,12 @@ const localComms = new Map<string, RepairOrderCommEntry[]>([
 export async function getCommEntries(
   repairOrderId: string,
 ): Promise<RepairOrderCommEntry[]> {
+  // A non-UUID id (sample/fallback board data) would make the query below
+  // throw "invalid input syntax for type uuid" — not a real DB failure, so
+  // skip the round-trip entirely and go straight to the local fallback.
+  if (!isUuid(repairOrderId)) {
+    return (localComms.get(repairOrderId) ?? []).map((e) => ({ ...e }));
+  }
   const supabase = getSupabaseBrowserClient();
   const result = await executeDBOperation<CommRow[]>(
     'getCommEntries',

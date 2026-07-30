@@ -37,7 +37,12 @@ export async function proxy(request: NextRequest) {
 
   // Touches the Auth server to refresh the token if needed; the setAll above
   // persists the refreshed cookie onto the response.
-  await supabase.auth.getUser();
+  try {
+    await supabase.auth.getUser();
+  } catch {
+    // Gracefully handle invalid or missing refresh tokens without crashing logs
+    console.warn('Invalid session or refresh token, continuing unauthenticated.');
+  }
 
   return response;
 }

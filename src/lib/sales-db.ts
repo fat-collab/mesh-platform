@@ -11,10 +11,18 @@ import { assignStaff } from './assignments-db';
 import { getCurrentProfile } from './auth';
 import { MOCK_LEADS } from './sales-mock';
 import { MOCK_BOARD_ORDERS } from './ops-mock';
+import { bridgeRepairOrder } from '@/app/actions/intake-bridge';
 import type {
+  DispatchStatus,
+  IntakeDocumentRef,
   IntakeLead,
   IntakeSubmission,
+  LeadChannel,
   LeadStatus,
+  ProxyPolicyholder,
+  RemoteAobStatus,
+  RoutingPath,
+  StormSeverity,
 } from '@/components/sales/types';
 
 const LEADS_TABLE = 'intake_leads';
@@ -41,6 +49,18 @@ export interface LeadRow {
   assigned_staff_id?: string | null;
   assigned_staff_name?: string | null;
   created_at: string;
+  channel?: LeadChannel | null;
+  storm_tag?: string | null;
+  zip_code?: string | null;
+  severity?: StormSeverity | null;
+  damage_photos?: IntakeDocumentRef[] | null;
+  routing_path?: RoutingPath | null;
+  dispatch_staff_name?: string | null;
+  dispatch_status?: DispatchStatus | null;
+  policyholder_match?: boolean | null;
+  proxy_policyholder?: ProxyPolicyholder | null;
+  remote_aob_status?: RemoteAobStatus | null;
+  remote_aob_token?: string | null;
 }
 
 function rowToLead(row: LeadRow): IntakeLead {
@@ -61,6 +81,20 @@ function rowToLead(row: LeadRow): IntakeLead {
     agreementAccepted: row.agreement_accepted ?? undefined,
     assignedStaffId: row.assigned_staff_id ?? undefined,
     assignedStaffName: row.assigned_staff_name ?? undefined,
+    // Pre-hub leads predate the channel column — default to the Digital
+    // Inbound tab (web/social source) rather than orphaning them.
+    channel: row.channel ?? 'DIGITAL_INBOUND',
+    stormTag: row.storm_tag ?? undefined,
+    zipCode: row.zip_code ?? undefined,
+    severity: row.severity ?? undefined,
+    damagePhotos: row.damage_photos ?? undefined,
+    routingPath: row.routing_path ?? undefined,
+    dispatchStaffName: row.dispatch_staff_name ?? undefined,
+    dispatchStatus: row.dispatch_status ?? undefined,
+    policyholderMatch: row.policyholder_match ?? undefined,
+    proxyPolicyholder: row.proxy_policyholder ?? undefined,
+    remoteAobStatus: row.remote_aob_status ?? undefined,
+    remoteAobToken: row.remote_aob_token ?? undefined,
   };
 }
 
@@ -69,6 +103,24 @@ function genId(prefix: string): string {
     return `${prefix}-${crypto.randomUUID()}`;
   }
   return `${prefix}-${Date.now()}-${Math.round(Math.random() * 1e6)}`;
+}
+
+/**
+ * A bare, RFC4122 v4-shaped id — unlike genId()'s prefixed ids, this is a
+ * valid Postgres `uuid` literal. Use for any id that gets inserted as the
+ * `id` of a table with a native `uuid` primary key (e.g. repair_orders),
+ * where a prefixed id like 'ro-<uuid>' fails with 22P02 ("invalid input
+ * syntax for type uuid").
+ */
+function genUuid(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
 }
 
 // Session-local lead store — the fallback when the DB table is unavailable —
@@ -111,6 +163,28 @@ const intakePackages: Record<string, IntakeSubmission> = {};
 const leadRoMap = new Map<string, string>();
 
 /**
+ * Converted leads available to pull into a manual Ops intake, each enriched
+ * with a computed damage-notes summary (condition notes + flagged walkaround
+ * items) from its original mobile-intake submission, mirroring the note
+ * logic bridgeIntakeToOps already uses when auto-creating an RO.
+ */
+export async function getConvertedLeadsForPull(): Promise<(IntakeLead & { damageNotes: string })[]> {
+  const leads = await getLeads();
+  return leads
+    .filter((l) => l.status === 'CONVERTED')
+    .map((l) => {
+      const submission = intakePackages[l.id];
+      const walkFlags = (submission?.walkaround ?? [])
+        .filter((w) => w.flagged)
+        .map((w) => w.label);
+      const noteParts: string[] = [];
+      if (submission?.conditionNotes) noteParts.push(submission.conditionNotes);
+      if (walkFlags.length) noteParts.push(`Pre-existing: ${walkFlags.join(', ')}`);
+      return { ...l, damageNotes: noteParts.join(' · ') };
+    });
+}
+
+/**
  * Bridges an intake lead into an active Repair Order on the shop Ops board.
  * Resolves the lead + stored intake submission by id from the local stores,
  * maps customer / vehicle / VIN / claim / carrier and the walkaround, hail
@@ -126,21 +200,29 @@ async function bridgeIntakeToOps(leadId: string): Promise<string> {
   if (!lead) throw new Error(`Lead ${leadId} not found`);
   const submission = intakePackages[leadId];
 
-  const roId = genId('ro');
+  const roId = genUuid();
   leadRoMap.set(leadId, roId);
   const now = new Date().toISOString();
 
-  // Best-effort DB insert — repair_orders carries only core fields.
+  // Best-effort DB insert, routed through a Server Action: the browser's
+  // anon-key client 403s on repair_orders (RLS), so the actual privileged
+  // insert runs server-side with the service-role client instead.
+  // organization_id is NOT NULL on repair_orders — resolve the same way
+  // convertLeadToRO does (session org, else first DB org as a dev fallback).
   try {
-    const supabase = getSupabaseBrowserClient();
-    await supabase.from('repair_orders').insert({
+    const organizationId = await resolveOrganizationId();
+    const result = await bridgeRepairOrder({
       id: roId,
-      customer_name: lead.customerName,
-      claim_number: lead.claimNumber,
-      stage: 'INTAKE',
+      customerName: lead.customerName,
+      claimNumber: lead.claimNumber || null,
+      organizationId: organizationId || null,
     });
-  } catch {
+    if (!result.success) {
+      console.warn(`[sales-db] repair_orders insert failed for RO ${roId}:`, result.error);
+    }
+  } catch (err) {
     /* ignore — the local board bridge below is the dev source of truth */
+    console.warn(`[sales-db] repair_orders server action failed for RO ${roId}:`, err);
   }
 
   const activeHail = (submission?.hailMatrix ?? []).filter((h) => h.severity !== 'NONE');
@@ -177,14 +259,38 @@ async function bridgeIntakeToOps(leadId: string): Promise<string> {
 }
 
 /**
- * Persists a mobile intake package as an active lead record: creates the lead
- * (status NEW), stores its document references / signature / walkaround in the
+ * Auto-convert business rule, shared by every path that can put a lead into
+ * AOB_SIGNED: a claim number on file means the engagement agreement being
+ * signed — on-site or via a remote proxy signing link — immediately converts
+ * the lead into an active Repair Order. Best-effort: a conversion failure
+ * never rolls back or blocks the status/creation that triggered it.
+ */
+async function maybeAutoConvertOnAobSigned(leadId: string, status: LeadStatus, claimNumber: string | undefined): Promise<void> {
+  if (status !== 'AOB_SIGNED' || !claimNumber) return;
+  try {
+    await convertLeadToRO(leadId);
+  } catch (err) {
+    console.warn(`[sales-db] auto-conversion on AOB_SIGNED failed for lead ${leadId}:`, err);
+  }
+}
+
+/**
+ * Persists a mobile intake package as an active lead record: creates the
+ * lead, stores its document references / signature / walkaround in the
  * session-local package store, and returns the created lead. Attempts a DB
  * insert first; falls back to local storage when the table is unavailable.
+ *
+ * In-Person AOB Execution Gate: a captured on-site signature creates the lead
+ * directly at AOB_SIGNED (immediately triggering the auto-convert-to-RO
+ * rule) rather than NEW + a flag needing a later manual status change. A
+ * lead routed to a remote proxy policyholder instead (no on-site signature)
+ * is created at NEW, pending the Remote AOB Execution Gate.
  */
 export async function saveIntakePackage(submission: IntakeSubmission): Promise<IntakeLead> {
   ensureSeed();
   const id = genId('lead');
+  const status: LeadStatus = submission.signatureDataUrl ? 'AOB_SIGNED' : 'NEW';
+  const policyholderMatch = submission.policyholderMatch ?? true;
   const lead: IntakeLead = {
     id,
     customerName: submission.customerName,
@@ -196,12 +302,18 @@ export async function saveIntakePackage(submission: IntakeSubmission): Promise<I
     vinLast8: submission.vinLast8,
     insuranceCarrier: submission.insuranceCarrier,
     claimNumber: submission.claimNumber,
-    status: 'NEW',
+    status,
     intakeDate: new Date().toISOString(),
     estimatedAmount: submission.estimatedAmount,
     agreementAccepted: Boolean(submission.signatureDataUrl),
     assignedStaffId: submission.assignedStaffId,
     assignedStaffName: submission.assignedStaffName,
+    // The mobile wizard IS the field agent's on-site capture tool — leads
+    // created through it belong on the Field Agent Dispatch tab.
+    channel: 'FIELD_DISPATCH',
+    policyholderMatch,
+    proxyPolicyholder: policyholderMatch ? undefined : submission.proxyPolicyholder ?? undefined,
+    remoteAobStatus: policyholderMatch ? undefined : 'NOT_SENT',
   };
 
   try {
@@ -227,6 +339,10 @@ export async function saveIntakePackage(submission: IntakeSubmission): Promise<I
       agreement_accepted: lead.agreementAccepted ?? false,
       assigned_staff_id: lead.assignedStaffId ?? null,
       assigned_staff_name: lead.assignedStaffName ?? null,
+      channel: lead.channel,
+      policyholder_match: policyholderMatch,
+      proxy_policyholder: lead.proxyPolicyholder ?? null,
+      remote_aob_status: lead.remoteAobStatus ?? null,
     });
     if (error) {
       /* fall through to local store */
@@ -240,10 +356,112 @@ export async function saveIntakePackage(submission: IntakeSubmission): Promise<I
   // Completing a mobile intake creates a corresponding active RO on the shop
   // floor, carrying the field walkaround / hail / document context.
   await bridgeIntakeToOps(id);
+  await maybeAutoConvertOnAobSigned(id, status, lead.claimNumber);
   return lead;
 }
 
-/** Updates a lead's pipeline status (DB when available, else local). */
+export interface DigitalLeadInput {
+  customerName: string;
+  phone: string;
+  email: string;
+  vehicleYear: number;
+  vehicleMake: string;
+  vehicleModel: string;
+  insuranceCarrier: string;
+  claimNumber: string;
+  estimatedAmount: number;
+  stormTag: string;
+  zipCode: string;
+  severity: StormSeverity;
+  /** Full captured document vault (DL front/back, insurance card, prior
+   *  estimate, dynamic carrier checklist, damage photos) — persisted as-is
+   *  to the intake_leads.documents column. */
+  documents: IntakeDocumentRef[];
+  policyholderMatch: boolean;
+  proxyPolicyholder?: ProxyPolicyholder | null;
+}
+
+/**
+ * Creates a Digital Inbound & Storm Triage lead — the lightweight web/social
+ * intake path, distinct from the full mobile-intake wizard (no signature/AOB
+ * agreement at this stage; that happens later in the pipeline). Attempts a DB
+ * insert first; always mirrors to the local store as the fallback.
+ */
+export async function createDigitalLead(input: DigitalLeadInput): Promise<IntakeLead> {
+  ensureSeed();
+  const id = genId('lead');
+  const lead: IntakeLead = {
+    id,
+    customerName: input.customerName,
+    phone: input.phone,
+    email: input.email,
+    vehicleYear: input.vehicleYear,
+    vehicleMake: input.vehicleMake,
+    vehicleModel: input.vehicleModel,
+    vinLast8: '',
+    insuranceCarrier: input.insuranceCarrier,
+    claimNumber: input.claimNumber,
+    status: 'NEW',
+    intakeDate: new Date().toISOString(),
+    estimatedAmount: input.estimatedAmount,
+    channel: 'DIGITAL_INBOUND',
+    stormTag: input.stormTag || undefined,
+    zipCode: input.zipCode || undefined,
+    severity: input.severity,
+    damagePhotos: input.documents.filter((d) => d.kind === 'DAMAGE_PHOTO'),
+    policyholderMatch: input.policyholderMatch,
+    proxyPolicyholder: input.policyholderMatch ? undefined : input.proxyPolicyholder ?? undefined,
+    remoteAobStatus: input.policyholderMatch ? undefined : 'NOT_SENT',
+  };
+
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const { error } = await supabase.from(LEADS_TABLE).insert({
+      id: lead.id,
+      customer_name: lead.customerName,
+      phone: lead.phone,
+      email: lead.email,
+      vehicle_year: lead.vehicleYear,
+      vehicle_make: lead.vehicleMake,
+      vehicle_model: lead.vehicleModel,
+      vehicle_info: `${lead.vehicleYear} ${lead.vehicleMake} ${lead.vehicleModel}`.trim(),
+      insurance_carrier: lead.insuranceCarrier,
+      claim_number: lead.claimNumber,
+      estimated_amount: lead.estimatedAmount,
+      documents: input.documents,
+      walkaround_notes: [],
+      status: lead.status,
+      created_at: lead.intakeDate,
+      channel: lead.channel,
+      storm_tag: lead.stormTag ?? null,
+      zip_code: lead.zipCode ?? null,
+      severity: lead.severity ?? null,
+      damage_photos: lead.damagePhotos ?? [],
+      policyholder_match: lead.policyholderMatch,
+      proxy_policyholder: lead.proxyPolicyholder ?? null,
+      remote_aob_status: lead.remoteAobStatus ?? null,
+    });
+    if (error) {
+      /* fall through to local store */
+    }
+  } catch {
+    /* fall through to local store */
+  }
+
+  localLeads.unshift({ ...lead });
+  return lead;
+}
+
+/**
+ * Updates a lead's pipeline status (DB when available, else local).
+ *
+ * Automated state machine: a transition INTO 'AOB_SIGNED' (the engagement
+ * agreement is signed — the definitive "signed sales estimate" moment) with a
+ * claim number on file automatically converts the lead into an active Repair
+ * Order, mapping customer + insurance metadata into the Ops intake pipeline
+ * via convertLeadToRO. Best-effort: a conversion failure never rolls back or
+ * blocks the status change itself.
+ */
 export async function updateLeadStatus(id: string, status: LeadStatus): Promise<void> {
   try {
     const supabase = getSupabaseBrowserClient();
@@ -252,13 +470,18 @@ export async function updateLeadStatus(id: string, status: LeadStatus): Promise<
       .update({ status })
       .eq('id', id)
       .select('id');
-    if (!error && data && data.length > 0) return;
+    if (error || !data || data.length === 0) throw error ?? new Error('no rows updated');
   } catch {
     /* fall through to local */
   }
   ensureSeed();
+  // Keep the local mirror in sync regardless of which path persisted the
+  // status, so downstream reads (including the lifecycle hook below) see the
+  // current value rather than a stale cached copy.
   const lead = localLeads.find((l) => l.id === id);
   if (lead) lead.status = status;
+
+  await maybeAutoConvertOnAobSigned(id, status, lead?.claimNumber);
 }
 
 /**
@@ -291,11 +514,110 @@ export async function assignLeadStaff(
   }
 }
 
-/** Resolves the signed-in user's organization id (browser session), or ''. */
+/**
+ * Records the post-contact dual-path routing decision on a lead card:
+ * Book Shop Drop-off + Fleet Reservation, or Dispatch Mobile House Call. For
+ * the mobile path this also seeds the field-agent assignment and starts the
+ * dispatch lifecycle at DISPATCHED.
+ */
+export async function updateLeadRouting(
+  id: string,
+  routingPath: RoutingPath,
+  dispatchStaffName?: string | null,
+): Promise<void> {
+  const dispatchStatus: DispatchStatus | null =
+    routingPath === 'MOBILE_HOUSE_CALL' ? 'DISPATCHED' : null;
+  const staffName = routingPath === 'MOBILE_HOUSE_CALL' ? dispatchStaffName?.trim() || null : null;
+
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const { data, error } = await supabase
+      .from(LEADS_TABLE)
+      .update({
+        routing_path: routingPath,
+        dispatch_staff_name: staffName,
+        dispatch_status: dispatchStatus,
+      })
+      .eq('id', id)
+      .select('id');
+    if (!error && data && data.length > 0) {
+      /* also fall through — keep the local mirror in sync below */
+    }
+  } catch {
+    /* fall through to local */
+  }
+  ensureSeed();
+  const lead = localLeads.find((l) => l.id === id);
+  if (lead) {
+    lead.routingPath = routingPath;
+    lead.dispatchStaffName = staffName ?? undefined;
+    lead.dispatchStatus = dispatchStatus ?? undefined;
+  }
+}
+
+/** Advances a mobile house-call lead's field dispatch lifecycle. */
+export async function updateDispatchStatus(id: string, status: DispatchStatus): Promise<void> {
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const { data, error } = await supabase
+      .from(LEADS_TABLE)
+      .update({ dispatch_status: status })
+      .eq('id', id)
+      .select('id');
+    if (!error && data && data.length > 0) {
+      /* also fall through — keep the local mirror in sync below */
+    }
+  } catch {
+    /* fall through to local */
+  }
+  ensureSeed();
+  const lead = localLeads.find((l) => l.id === id);
+  if (lead) lead.dispatchStatus = status;
+}
+
+/**
+ * Records that a Remote AOB Secure Signing Link was created and dispatched
+ * for a lead (called by the remote-aob API route after the email/SMS send).
+ */
+export async function markRemoteAobDispatched(leadId: string, token: string): Promise<void> {
+  try {
+    const supabase = getSupabaseBrowserClient();
+    await supabase
+      .from(LEADS_TABLE)
+      .update({ remote_aob_status: 'SENT', remote_aob_token: token })
+      .eq('id', leadId);
+  } catch {
+    /* fall through to local */
+  }
+  ensureSeed();
+  const lead = localLeads.find((l) => l.id === leadId);
+  if (lead) {
+    lead.remoteAobStatus = 'SENT';
+    lead.remoteAobToken = token;
+  }
+}
+
+/**
+ * Resolves an organization id to write RO/vehicle rows against: the signed-in
+ * user's organization (browser session) first, falling back to the first
+ * organizations row in the DB (dev fallback, e.g. for a seeded demo session
+ * with no org on the profile). Returns '' when neither is available.
+ */
 async function resolveOrganizationId(): Promise<string> {
   try {
     const profile = await getCurrentProfile(getSupabaseBrowserClient());
-    return profile?.organizationId ?? '';
+    if (profile?.organizationId) return profile.organizationId;
+  } catch {
+    /* fall through to the DB default lookup below */
+  }
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const { data: defaultOrg } = await supabase
+      .from('organizations')
+      .select('id')
+      .limit(1)
+      .maybeSingle();
+    return (defaultOrg as { id: string } | null)?.id ?? '';
   } catch {
     return '';
   }
@@ -317,42 +639,55 @@ export async function convertLeadToRO(
   const cached = leadRoMap.get(leadId);
   if (cached) return cached;
 
-  let activeOrgId = organizationId;
-
-  // 1. If no org id was passed, try resolving from the current session.
-  if (!activeOrgId) {
-    activeOrgId = await resolveOrganizationId();
-  }
-
-  // 2. If session is empty, auto-fetch a default org from the DB (dev fallback).
-  if (!activeOrgId) {
-    try {
-      const supabase = getSupabaseBrowserClient();
-      const { data: defaultOrg } = await supabase
-        .from('organizations')
-        .select('id')
-        .limit(1)
-        .maybeSingle();
-      activeOrgId = (defaultOrg as { id: string } | null)?.id ?? '';
-    } catch {
-      /* ignore — proceed to local fallback if tables aren't there yet */
-    }
-  }
+  // If no org id was passed, resolve from the current session, falling back
+  // to the first DB org (dev fallback) — see resolveOrganizationId().
+  const activeOrgId = organizationId || (await resolveOrganizationId());
 
   const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-  // 3. If an organization was secured and the ID is a valid database UUID, run the true multi-step DB flow.
-  if (activeOrgId && UUID_REGEX.test(leadId)) {
+  // Prefix normalization: locally-generated lead ids carry a 'lead-' prefix
+  // (genId('lead')) that isn't part of the underlying UUID once one exists —
+  // strip it before matching/querying so a DB-backed lead can still be found
+  // even when the caller's reference carries the local-only prefix.
+  const normalizedLeadId = leadId.startsWith('lead-') ? leadId.slice('lead-'.length) : leadId;
+
+  // 3. If an organization was secured and the normalized ID is a valid
+  // database UUID, attempt the true multi-step DB flow.
+  if (activeOrgId && UUID_REGEX.test(normalizedLeadId)) {
     try {
       const supabase = getSupabaseBrowserClient();
 
       const { data, error: leadError } = await supabase
         .from(LEADS_TABLE)
         .select('*')
-        .eq('id', leadId)
-        .single();
-      if (leadError || !data) throw new Error(`Failed to fetch lead: ${leadError?.message}`);
-      const lead = data as unknown as LeadRow;
+        .eq('id', normalizedLeadId)
+        .maybeSingle();
+      if (leadError) throw new Error(`Failed to fetch lead: ${leadError.message}`);
+
+      let lead = data as unknown as LeadRow | null;
+
+      // Graceful local fallback: zero rows (e.g. an unpersisted mock/seed
+      // lead) is not a hard failure — intercept the miss, pull the payload
+      // from the active local cache, and continue provisioning the RO from
+      // it instead of throwing.
+      if (!lead) {
+        ensureSeed();
+        const cached = localLeads.find((l) => l.id === leadId);
+        if (!cached) throw new Error(`Lead ${leadId} not found in DB or local cache.`);
+        lead = {
+          id: cached.id,
+          customer_name: cached.customerName,
+          vehicle_info: `${cached.vehicleYear} ${cached.vehicleMake} ${cached.vehicleModel}`.trim(),
+          vin: cached.vinLast8 || null,
+          claim_number: cached.claimNumber || null,
+          documents: {},
+          walkaround_notes: {},
+          status: cached.status,
+          assigned_staff_id: cached.assignedStaffId ?? null,
+          assigned_staff_name: cached.assignedStaffName ?? null,
+          created_at: cached.intakeDate,
+        };
+      }
 
       // Provision vehicle record.
       const { data: vehicle, error: vehicleError } = await supabase
@@ -383,12 +718,16 @@ export async function convertLeadToRO(
         .single();
       if (roError || !ro) throw new Error(`Repair order creation failed: ${roError?.message}`);
 
-      // Archive lead status so it drops off the Sales intake queue.
+      // Archive lead status so it drops off the Sales intake queue. Best-effort
+      // (non-fatal): a lead sourced from the local-cache fallback above has no
+      // matching DB row to update, and that must not block RO creation.
       const { error: updateError } = await supabase
         .from(LEADS_TABLE)
         .update({ status: 'CONVERTED' })
-        .eq('id', leadId);
-      if (updateError) throw new Error(`Lead status update failed: ${updateError.message}`);
+        .eq('id', normalizedLeadId);
+      if (updateError) {
+        console.warn(`[sales-db] lead status archive failed for ${leadId}:`, updateError.message);
+      }
 
       const roId = String((ro as { id: string }).id);
       leadRoMap.set(leadId, roId);

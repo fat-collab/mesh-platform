@@ -98,6 +98,9 @@ export async function POST(request: Request): Promise<Response> {
     engagementAccepted: b.engagementAccepted === true,
     staff: normalizeStaff(b.staff),
     pdrMatrix: normalizeMatrix(b.pdrMatrix),
+    // Absent/undefined defaults to true (has a fleet) — only an explicit
+    // false opts a partner/independent shop out of fleet reservation.
+    hasFleet: b.hasFleet !== false,
   };
 
   const errors: string[] = [];

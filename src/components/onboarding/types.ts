@@ -41,6 +41,11 @@ export interface ShopConfig {
   engagementAccepted: boolean;
   staff: StaffMember[];
   pdrMatrix: PdrMatrixRow[];
+  /** Whether this shop maintains its own loaner/rental fleet. Defaults to
+   *  true when unset, so existing shops keep today's fleet-reservation flow.
+   *  Partner/independent shops without a fleet toggle this off so the Shop
+   *  Drop-off routing action skips vehicle allocation entirely. */
+  hasFleet?: boolean;
   updatedAt?: string;
 }
 
@@ -48,6 +53,7 @@ export const STAFF_ROLES: readonly string[] = [
   'TECH',
   'PDR_TECH',
   'ESTIMATOR',
+  'SALES',
   'MANAGER',
   'ADJUSTER',
   'EXECUTIVE',

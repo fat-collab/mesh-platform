@@ -5,12 +5,21 @@ import { isHoldStage, riskTone, type BoardOrder } from '@/lib/board';
 import type { Database, RoStage } from '@/lib/database.types';
 import type { RealtimePostgresChangesPayload } from '@supabase/supabase-js';
 import { getSupabaseBrowserClient } from '@/lib/supabase';
-import { fetchBoardOrders, persistStage, persistUnlock, persistRepairOrder } from '@/lib/ops-data';
+import { getCurrentProfile } from '@/lib/auth';
+import {
+  fetchBoardOrders,
+  persistStage,
+  persistUnlock,
+  persistRepairOrder,
+  createManualIntake,
+} from '@/lib/ops-data';
 import { validateStageTransition } from '@/lib/stage-gates';
 import {
   EditRepairOrderModal,
   type EditRepairOrderPatch,
 } from '@/components/ops/EditRepairOrderModal';
+import { NewIntakeModal, type NewIntakePayload } from '@/components/ops/NewIntakeModal';
+import type { ShopConfig, StaffMember } from '@/components/onboarding/types';
 import { MOCK_BOARD_ORDERS, MOCK_PARTS_BY_CLAIM } from '@/lib/ops-mock';
 import { KanbanBoard } from '@/components/ops/KanbanBoard';
 import { UnlockGateModal } from '@/components/ops/UnlockGateModal';
@@ -33,10 +42,30 @@ export default function OpsCockpitPage() {
   const [unlockTarget, setUnlockTarget] = useState<BoardOrder | null>(null);
   const [selectedOrder, setSelectedOrder] = useState<BoardOrder | null>(null);
   const [editTarget, setEditTarget] = useState<BoardOrder | null>(null);
+  const [newIntakeOpen, setNewIntakeOpen] = useState(false);
+  const [staffRoster, setStaffRoster] = useState<StaffMember[]>([]);
   const [unlockBusy, setUnlockBusy] = useState(false);
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<BoardFilter>('all');
   const [view, setView] = useState<'board' | 'audit'>('board');
+
+  // Shop's configured staff roster — fetched once, powers each card's
+  // quick-assign dropdown so assignment picks a real staff member, not free text.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch('/api/v1/shop/config');
+        const json = (await res.json()) as { config?: ShopConfig | null };
+        if (!cancelled && json.config?.staff) setStaffRoster(json.config.staff);
+      } catch {
+        /* no configured roster yet — quick-assign stays empty */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -254,6 +283,58 @@ export default function OpsCockpitPage() {
     }
   }, [source]);
 
+  // Manual Ops intake creation (incl. "Pull from Sales"). DB-first: provisions
+  // a real vehicle + repair_order when possible; otherwise falls back to the
+  // shared local board so the new intake is still visible immediately.
+  const handleCreateIntake = useCallback(
+    async (payload: NewIntakePayload) => {
+      const now = new Date().toISOString();
+
+      if (source === 'supabase') {
+        const supabase = getSupabaseBrowserClient();
+        const profile = await getCurrentProfile(supabase);
+        if (profile?.organizationId) {
+          const { id, error } = await createManualIntake(supabase, {
+            organizationId: profile.organizationId,
+            customerName: payload.customerName,
+            vehicle: payload.vehicle,
+            vin: payload.vin || null,
+            claimNumber: payload.claimNumber || null,
+            insuranceCarrier: payload.insuranceCarrier || null,
+            intakeNotes: payload.intakeNotes || null,
+          });
+          if (!error) {
+            await refetchBoard();
+            setNotice(`Repair order created for ${payload.customerName}.`);
+            return;
+          }
+          setNotice(`Could not save to Supabase (${error}) — added to local board instead.`);
+        }
+      }
+
+      // Local fallback — mirrors the shared MOCK_BOARD_ORDERS bridge shape.
+      const id = `manual-${typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Date.now()}`;
+      const newOrder: BoardOrder = {
+        id,
+        claim_number: payload.claimNumber || null,
+        customer_name: payload.customerName,
+        vehicle: payload.vehicle,
+        vin: payload.vin || null,
+        location: 'Intake',
+        stage: 'INTAKE',
+        hold_gate_active: false,
+        risk_score: null,
+        created_at: now,
+        updated_at: now,
+        insuranceCarrier: payload.insuranceCarrier || null,
+        intakeNotes: payload.intakeNotes || null,
+      };
+      MOCK_BOARD_ORDERS.push(newOrder);
+      setOrders((prev) => [...prev, newOrder]);
+    },
+    [source, refetchBoard],
+  );
+
   // Edit save: optimistic patch, then persist (Supabase) + refetch, or mutate
   // the shared mock board (sample mode) so the change survives across views.
   const handleEditSave = useCallback(
@@ -376,15 +457,24 @@ export default function OpsCockpitPage() {
               </span>
             </p>
           </div>
-          <span
-            className={
-              source === 'supabase'
-                ? 'rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-300'
-                : 'rounded-full border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-xs font-medium text-zinc-400'
-            }
-          >
-            {source === 'supabase' ? 'Live · Supabase' : 'Sample data'}
-          </span>
+          <div className="flex items-center gap-2">
+            <span
+              className={
+                source === 'supabase'
+                  ? 'rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-300'
+                  : 'rounded-full border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-xs font-medium text-zinc-400'
+              }
+            >
+              {source === 'supabase' ? 'Live · Supabase' : 'Sample data'}
+            </span>
+            <button
+              type="button"
+              onClick={() => setNewIntakeOpen(true)}
+              className="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-semibold text-white transition-colors hover:bg-sky-500"
+            >
+              + New Intake
+            </button>
+          </div>
         </header>
 
         {/* View toggle */}
@@ -452,6 +542,7 @@ export default function OpsCockpitPage() {
               onRequestUnlock={setUnlockTarget}
               onSelectOrder={setSelectedOrder}
               onEditOrder={setEditTarget}
+              staffRoster={staffRoster}
             />
           </>
         )}
@@ -485,6 +576,13 @@ export default function OpsCockpitPage() {
           order={editTarget}
           onClose={() => setEditTarget(null)}
           onSave={handleEditSave}
+        />
+      )}
+
+      {newIntakeOpen && (
+        <NewIntakeModal
+          onClose={() => setNewIntakeOpen(false)}
+          onCreate={handleCreateIntake}
         />
       )}
     </div>

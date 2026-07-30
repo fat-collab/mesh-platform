@@ -1,10 +1,13 @@
 'use client';
 
 /**
- * /dashboard/setup — the onboarding gateway. Collects shop contact details and
- * requires click-wrap acceptance of the MESH Legal Shield before the org can be
- * used. Landed on directly after registration; redirects to the Ops board once
+ * /dashboard/setup — the onboarding gateway. Collects/confirms shop contact
+ * details, auto-filled from the organization's existing record. Landed on
+ * directly after registration; redirects to the Ops board once
  * setup_completed is true (including on repeat visits).
+ *
+ * The legal click-wrap (Terms of Service acceptance) has moved upstream to
+ * registration — this page no longer gates on it.
  */
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
@@ -14,9 +17,15 @@ import { getCurrentProfile } from '@/lib/auth';
 const DEST = '/dashboard/ops';
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-const TOS_TEXT = `SaaS Provision Only: MESH is a software-as-a-service operational tool provided 'as is' and 'as available.' MESH, its developers, and its principals disclaim all liability for financial calculations, repair order estimates, subcontractor tracking, rental reimbursements, or data loss arising from shop operations. Tenant Data Autonomy: The subscribing Organization ('Shop') maintains sole legal and regulatory responsibility for compliance, tax filings, consumer privacy, and data governance within their jurisdiction. Indemnification Shield: The Shop agrees to indemnify, defend, and hold harmless MESH and its principals from any third-party claims, subcontractor disputes, regulatory penalties, or operational losses resulting from the use of the platform.`;
-
 type Gate = 'checking' | 'ready';
+
+interface OrganizationRow {
+  name: string | null;
+  setup_completed: boolean;
+  shop_phone: string | null;
+  shop_email: string | null;
+  tax_id: string | null;
+}
 
 interface SetupResponse {
   success?: boolean;
@@ -27,14 +36,15 @@ export default function DashboardSetupPage() {
   const router = useRouter();
   const [gate, setGate] = useState<Gate>('checking');
 
+  const [shopName, setShopName] = useState('');
   const [shopPhone, setShopPhone] = useState('');
   const [shopEmail, setShopEmail] = useState('');
   const [taxId, setTaxId] = useState('');
-  const [agreed, setAgreed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Resolve the session; skip straight past setup if it's already complete.
+  // Resolve the session, auto-fill from the org's existing record, and skip
+  // straight past setup if it's already complete.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -50,13 +60,21 @@ export default function DashboardSetupPage() {
       if (profile.organizationId) {
         const { data } = await supabase
           .from('organizations')
-          .select('setup_completed')
+          .select('name, setup_completed, shop_phone, shop_email, tax_id')
           .eq('id', profile.organizationId)
           .maybeSingle();
         if (cancelled) return;
-        if ((data as { setup_completed: boolean } | null)?.setup_completed) {
+
+        const org = data as OrganizationRow | null;
+        if (org?.setup_completed) {
           router.replace(DEST);
           return;
+        }
+        if (org) {
+          setShopName(org.name ?? '');
+          setShopPhone(org.shop_phone ?? '');
+          setShopEmail(org.shop_email ?? '');
+          setTaxId(org.tax_id ?? '');
         }
       }
 
@@ -71,16 +89,12 @@ export default function DashboardSetupPage() {
     e.preventDefault();
     setError(null);
 
-    if (!shopPhone.trim() || !shopEmail.trim() || !taxId.trim()) {
+    if (!shopName.trim() || !shopPhone.trim() || !shopEmail.trim() || !taxId.trim()) {
       setError('All fields are required.');
       return;
     }
     if (!EMAIL_RE.test(shopEmail.trim())) {
       setError('Enter a valid shop email address.');
-      return;
-    }
-    if (!agreed) {
-      setError('You must accept the Terms of Service to continue.');
       return;
     }
 
@@ -101,7 +115,7 @@ export default function DashboardSetupPage() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${session.access_token}`,
         },
-        body: JSON.stringify({ shopPhone, shopEmail, taxId }),
+        body: JSON.stringify({ shopName, shopPhone, shopEmail, taxId }),
       });
       const result = (await res.json()) as SetupResponse;
       if (!res.ok || !result.success) {
@@ -134,7 +148,7 @@ export default function DashboardSetupPage() {
         <div className="mb-6 text-center">
           <h1 className="text-2xl font-bold tracking-tight">Finish setting up your shop</h1>
           <p className="mt-1 text-sm text-zinc-400">
-            A few details before you jump into the Ops Cockpit.
+            Confirm your shop details before you jump into the Ops Cockpit.
           </p>
         </div>
 
@@ -142,6 +156,22 @@ export default function DashboardSetupPage() {
           onSubmit={handleSubmit}
           className="space-y-5 rounded-xl border border-zinc-800 bg-zinc-900/60 p-6 shadow-xl"
         >
+          <div>
+            <label htmlFor="shopName" className={labelCls}>
+              Shop name
+            </label>
+            <input
+              id="shopName"
+              type="text"
+              autoComplete="organization"
+              required
+              value={shopName}
+              onChange={(e) => setShopName(e.target.value)}
+              className={input}
+              placeholder="Apex Collision Center"
+            />
+          </div>
+
           <div className="grid gap-4 sm:grid-cols-2">
             <div>
               <label htmlFor="shopPhone" className={labelCls}>
@@ -191,24 +221,6 @@ export default function DashboardSetupPage() {
             />
           </div>
 
-          {/* MESH Legal Shield — click-wrap acceptance */}
-          <div>
-            <p className={labelCls}>MESH Legal Shield</p>
-            <blockquote className="max-h-40 overflow-y-auto rounded-md border border-zinc-700 bg-zinc-950 p-3 text-xs leading-relaxed text-zinc-400">
-              {TOS_TEXT}
-            </blockquote>
-            <label className="mt-2 flex items-start gap-2 text-xs text-zinc-300">
-              <input
-                type="checkbox"
-                required
-                checked={agreed}
-                onChange={(e) => setAgreed(e.target.checked)}
-                className="mt-0.5"
-              />
-              I have read and agree to the MESH Terms of Service and Legal Shield above.
-            </label>
-          </div>
-
           {error && (
             <p className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300">
               {error}
@@ -217,7 +229,7 @@ export default function DashboardSetupPage() {
 
           <button
             type="submit"
-            disabled={busy || !agreed}
+            disabled={busy}
             className="w-full rounded-md bg-sky-600 px-3 py-2 text-sm font-semibold text-white transition-colors hover:bg-sky-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 disabled:opacity-60"
           >
             {busy ? 'Finishing setup…' : 'Complete setup & enter Ops Cockpit'}

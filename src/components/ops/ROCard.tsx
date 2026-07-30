@@ -1,4 +1,11 @@
-import type { CSSProperties, MouseEvent, PointerEvent } from 'react';
+import {
+  useEffect,
+  useState,
+  type ChangeEvent,
+  type CSSProperties,
+  type MouseEvent,
+  type PointerEvent,
+} from 'react';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { clsx } from 'clsx';
@@ -9,6 +16,25 @@ import {
   type BoardOrder,
 } from '@/lib/board';
 import { HoldGateBadge, LockIcon } from './HoldGateBadge';
+import { getAssignments, assignStaff, removeAssignment } from '@/lib/assignments-db';
+import type { OrderAssignment, StaffRole } from './types';
+import type { StaffMember } from '@/components/onboarding/types';
+
+/** Best-effort mapping from the shop roster's onboarding role to an RO's
+ *  assignment role — the roster dropdown picks WHO, this fills in a sensible
+ *  default for the ops-side role (fine-tunable later in the RO drawer). */
+function mapOnboardingRoleToOpsRole(role: string): StaffRole {
+  switch (role) {
+    case 'ESTIMATOR':
+      return 'ESTIMATOR';
+    case 'SALES':
+      return 'SALES';
+    case 'MANAGER':
+      return 'FOREMAN';
+    default:
+      return 'BODY_TECH'; // TECH, PDR_TECH, ADJUSTER, EXECUTIVE, unknown
+  }
+}
 
 const RISK_TONE_CLASS: Record<'low' | 'medium' | 'high', string> = {
   low: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300',
@@ -56,6 +82,8 @@ interface ROCardViewProps {
   onRequestUnlock?: (order: BoardOrder) => void;
   onSelect?: (order: BoardOrder) => void;
   onEdit?: (order: BoardOrder) => void;
+  /** Shop's configured staff roster — powers the quick-assign dropdown. */
+  staffRoster?: StaffMember[];
   setNodeRef?: (el: HTMLElement | null) => void;
   style?: CSSProperties;
   handleProps?: Record<string, unknown>;
@@ -69,12 +97,51 @@ export function ROCardView({
   onRequestUnlock,
   onSelect,
   onEdit,
+  staffRoster = [],
   setNodeRef,
   style,
   handleProps,
 }: ROCardViewProps) {
   const gateType = gateTypeForStage(order.stage);
   const inHoldStage = isHoldStage(order.stage);
+
+  const [assignments, setAssignments] = useState<OrderAssignment[]>([]);
+  const [assigning, setAssigning] = useState(false);
+
+  const loadAssignments = () => {
+    void getAssignments(order.id).then(setAssignments);
+  };
+
+  useEffect(() => {
+    if (overlay) return; // the drag-overlay ghost doesn't need live data
+    loadAssignments();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [order.id, overlay]);
+
+  const assignedNames = new Set(assignments.map((a) => a.staffName));
+  const availableRoster = staffRoster.filter((s) => !assignedNames.has(s.name));
+
+  const handleAssign = async (e: ChangeEvent<HTMLSelectElement>) => {
+    const staffId = e.target.value;
+    e.target.value = '';
+    const member = staffRoster.find((s) => s.id === staffId);
+    if (!member || assigning) return;
+    setAssigning(true);
+    try {
+      await assignStaff(order.id, {
+        staffName: member.name,
+        role: mapOnboardingRoleToOpsRole(member.role),
+      });
+      loadAssignments();
+    } finally {
+      setAssigning(false);
+    }
+  };
+
+  const handleUnassign = async (assignmentId: string) => {
+    await removeAssignment(assignmentId);
+    loadAssignments();
+  };
 
   const handleDetailsClick = (e: MouseEvent | PointerEvent) => {
     e.stopPropagation();
@@ -132,6 +199,52 @@ export function ROCardView({
           <span className="truncate">{order.assignedStaffName}</span>
         </p>
       )}
+
+      {/* Multi-technician assignment grid */}
+      <div className="mt-1.5 flex flex-wrap items-center gap-1">
+        {assignments.map((a) => (
+          <span
+            key={a.id}
+            className="inline-flex items-center gap-1 rounded-md border border-zinc-700 bg-zinc-900/60 px-1.5 py-0.5 text-[10px] font-medium text-zinc-300"
+          >
+            {a.staffName}
+            <button
+              type="button"
+              onPointerDown={(e) => e.stopPropagation()}
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                void handleUnassign(a.id);
+              }}
+              aria-label={`Unassign ${a.staffName}`}
+              className="relative z-20 text-zinc-500 hover:text-red-300"
+            >
+              ×
+            </button>
+          </span>
+        ))}
+        {availableRoster.length > 0 && (
+          <select
+            onPointerDown={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            onChange={(e) => void handleAssign(e)}
+            disabled={assigning}
+            defaultValue=""
+            aria-label="Assign technician from roster"
+            className="relative z-20 rounded-md border border-dashed border-zinc-700 bg-transparent px-1.5 py-0.5 text-[10px] font-medium text-zinc-500 hover:border-zinc-600 hover:text-zinc-300 disabled:opacity-50"
+          >
+            <option value="" disabled>
+              + Assign…
+            </option>
+            {availableRoster.map((s) => (
+              <option key={s.id} value={s.id} className="bg-zinc-900 text-zinc-200">
+                {s.name} ({s.role})
+              </option>
+            ))}
+          </select>
+        )}
+      </div>
 
       {(locked || inHoldStage) && (
         <div className="mt-2 flex flex-wrap items-center gap-1.5">
@@ -200,9 +313,10 @@ export interface ROCardProps {
   onRequestUnlock: (order: BoardOrder) => void;
   onSelect?: (order: BoardOrder) => void;
   onEdit?: (order: BoardOrder) => void;
+  staffRoster?: StaffMember[];
 }
 
-export function ROCard({ order, onRequestUnlock, onSelect, onEdit }: ROCardProps) {
+export function ROCard({ order, onRequestUnlock, onSelect, onEdit, staffRoster }: ROCardProps) {
   const locked = order.hold_gate_active;
   const {
     attributes,
@@ -230,6 +344,7 @@ export function ROCard({ order, onRequestUnlock, onSelect, onEdit }: ROCardProps
       onRequestUnlock={onRequestUnlock}
       onSelect={onSelect}
       onEdit={onEdit}
+      staffRoster={staffRoster}
       setNodeRef={setNodeRef}
       style={style}
       handleProps={{ ...attributes, ...listeners }}

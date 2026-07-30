@@ -35,6 +35,7 @@ import {
 } from '@/lib/board';
 import type { RoStage } from '@/lib/database.types';
 import { ROCard, ROCardView } from './ROCard';
+import type { StaffMember } from '@/components/onboarding/types';
 
 const HEADER_TONE: Record<StageTone, { text: string; bar: string }> = {
   neutral: { text: 'text-zinc-300', bar: 'bg-zinc-600' },
@@ -54,9 +55,10 @@ interface BoardColumnProps {
   onRequestUnlock: (order: BoardOrder) => void;
   onSelect?: (order: BoardOrder) => void;
   onEdit?: (order: BoardOrder) => void;
+  staffRoster?: StaffMember[];
 }
 
-function BoardColumn({ stage, orders, onRequestUnlock, onSelect, onEdit }: BoardColumnProps) {
+function BoardColumn({ stage, orders, onRequestUnlock, onSelect, onEdit, staffRoster }: BoardColumnProps) {
   const meta = STAGE_META[stage];
   const tone = HEADER_TONE[meta.tone];
   const { setNodeRef, isOver } = useDroppable({ id: stage });
@@ -88,6 +90,7 @@ function BoardColumn({ stage, orders, onRequestUnlock, onSelect, onEdit }: Board
               onRequestUnlock={onRequestUnlock}
               onSelect={onSelect}
               onEdit={onEdit}
+              staffRoster={staffRoster}
             />
           ))}
         </SortableContext>
@@ -108,6 +111,7 @@ export interface KanbanBoardProps {
   onRequestUnlock: (order: BoardOrder) => void;
   onSelectOrder?: (order: BoardOrder) => void;
   onEditOrder?: (order: BoardOrder) => void;
+  staffRoster?: StaffMember[];
 }
 
 export function KanbanBoard({
@@ -116,6 +120,7 @@ export function KanbanBoard({
   onRequestUnlock,
   onSelectOrder,
   onEditOrder,
+  staffRoster,
 }: KanbanBoardProps) {
   const [activeId, setActiveId] = useState<UniqueIdentifier | null>(null);
 
@@ -177,6 +182,7 @@ export function KanbanBoard({
             onRequestUnlock={onRequestUnlock}
             onSelect={onSelectOrder}
             onEdit={onEditOrder}
+            staffRoster={staffRoster}
           />
         ))}
       </div>

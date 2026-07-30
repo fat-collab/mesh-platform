@@ -1,13 +1,16 @@
 'use client';
 
 /**
- * ProcurementDashboardView — parts-only procurement engine.
+ * ProcurementDashboardView — pure job-costing procurement engine.
+ *
+ * No generalized warehouse SKU/stock catalog exists here — every part line
+ * item is strictly coupled to a repair order and its VIN.
  *
  * Tabs:
  *  1) Parts Request Queue — un-ordered parts (parts_line_items NEEDED) across
- *     active ROs, with a per-RO "Generate PO" action.
- *  2) Active Purchase Orders — outbound POs tied back to their RO (claim).
- *  3) Catalog & Vendors — the existing inventory catalog / price-matrix view.
+ *     active ROs, with a per-RO "Generate PO" action gated on the RO having a
+ *     VIN on file (job-costing enforcement).
+ *  2) Active Purchase Orders — outbound POs tied back to their RO + VIN.
  */
 import { useCallback, useEffect, useState } from 'react';
 import { clsx } from 'clsx';
@@ -25,12 +28,11 @@ import {
   type ProcurementPOStatus,
 } from '@/components/inventory/procurement-types';
 import { PART_SOURCING_LABEL } from '@/components/ops/types';
-import { InventoryManagementView } from '@/components/inventory/InventoryManagementView';
 
 const money = (n: number) =>
   n.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
 
-type Tab = 'queue' | 'pos' | 'catalog';
+type Tab = 'queue' | 'pos';
 
 const PO_STATUS_TONE: Record<ProcurementPOStatus, string> = {
   DRAFT: 'border-zinc-600/60 bg-zinc-700/40 text-zinc-300',
@@ -44,6 +46,7 @@ function PartsRequestQueuePanel({ onGenerated }: { onGenerated: () => void }) {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setGroups(await getPartsRequestQueue());
@@ -65,13 +68,22 @@ function PartsRequestQueuePanel({ onGenerated }: { onGenerated: () => void }) {
 
   const handleGenerate = async (group: PartsRequestGroup) => {
     if (busy) return;
-    setBusy(group.claimNumber);
+    setBusy(group.repairOrderId);
     setNotice(null);
+    setError(null);
     try {
-      await generatePurchaseOrder(group.claimNumber, group.parts);
+      await generatePurchaseOrder(
+        group.repairOrderId,
+        group.vin ?? '',
+        group.claimNumber,
+        group.customerName,
+        group.parts,
+      );
       setNotice(`PO drafted for ${group.claimNumber} — ${group.parts.length} part(s) marked Ordered.`);
       await refresh();
       onGenerated();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to generate PO.');
     } finally {
       setBusy(null);
     }
@@ -88,6 +100,11 @@ function PartsRequestQueuePanel({ onGenerated }: { onGenerated: () => void }) {
           {notice}
         </div>
       )}
+      {error && (
+        <div className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+          {error}
+        </div>
+      )}
       {groups.length === 0 ? (
         <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-6 text-center text-sm text-zinc-500">
           No un-ordered parts across active repair orders.
@@ -95,22 +112,29 @@ function PartsRequestQueuePanel({ onGenerated }: { onGenerated: () => void }) {
       ) : (
         groups.map((g) => {
           const total = g.parts.reduce((s, p) => s + (p.unitCost ?? 0) * (p.quantity ?? 1), 0);
+          const missingVin = !g.vin;
           return (
-            <div key={g.claimNumber} className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
+            <div key={g.repairOrderId} className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
               <div className="mb-2 flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <p className="font-mono text-xs font-semibold text-sky-300">{g.claimNumber}</p>
                   <p className="truncate text-[11px] text-zinc-500">
                     {g.customerName ?? '—'} · {g.vehicle} · {g.parts.length} part(s) needed
                   </p>
+                  {missingVin && (
+                    <p className="mt-0.5 text-[11px] text-amber-400">
+                      ⚠ No VIN on file — attach a vehicle to this RO before ordering.
+                    </p>
+                  )}
                 </div>
                 <button
                   type="button"
                   onClick={() => void handleGenerate(g)}
-                  disabled={busy === g.claimNumber}
-                  className="shrink-0 rounded-md bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-sky-500 disabled:opacity-50"
+                  disabled={busy === g.repairOrderId || missingVin}
+                  title={missingVin ? 'VIN required to generate a PO' : undefined}
+                  className="shrink-0 rounded-md bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  {busy === g.claimNumber ? 'Generating…' : 'Generate PO'}
+                  {busy === g.repairOrderId ? 'Generating…' : 'Generate PO'}
                 </button>
               </div>
               <ul className="divide-y divide-zinc-800/70 rounded-md border border-zinc-800">
@@ -188,16 +212,17 @@ function ActivePurchaseOrdersPanel({ reloadKey }: { reloadKey: number }) {
             <div className="mb-2 flex items-center justify-between gap-3">
               <div className="min-w-0">
                 <p className="font-mono text-xs font-semibold text-sky-300">
-                  {po.claimNumber} <span className="text-zinc-600">· RO</span>
+                  {po.claimNumber ?? 'NO CLAIM'} <span className="text-zinc-600">· RO</span>
                 </p>
                 <p className="text-[11px] text-zinc-500">
-                  {po.items.length} line(s) · {new Date(po.createdAt).toLocaleDateString()}
+                  {po.customerName ?? '—'} · VIN {po.vin} · {po.items.length} line(s) ·{' '}
+                  {new Date(po.createdAt).toLocaleDateString()}
                 </p>
               </div>
               <select
                 value={po.status}
                 onChange={(e) => void handleStatus(po.id, e.target.value as ProcurementPOStatus)}
-                aria-label={`Status for PO on ${po.claimNumber}`}
+                aria-label={`Status for PO ${po.id}`}
                 className={clsx(
                   'shrink-0 rounded-md border px-1.5 py-1 text-[11px] font-semibold focus:outline-none',
                   PO_STATUS_TONE[po.status],
@@ -239,7 +264,6 @@ export function ProcurementDashboardView() {
   const TABS: { id: Tab; label: string }[] = [
     { id: 'queue', label: 'Parts Request Queue' },
     { id: 'pos', label: 'Active Purchase Orders' },
-    { id: 'catalog', label: 'Catalog & Vendors' },
   ];
 
   return (
@@ -266,7 +290,6 @@ export function ProcurementDashboardView() {
         <PartsRequestQueuePanel onGenerated={() => setPoReloadKey((k) => k + 1)} />
       )}
       {tab === 'pos' && <ActivePurchaseOrdersPanel reloadKey={poReloadKey} />}
-      {tab === 'catalog' && <InventoryManagementView />}
     </div>
   );
 }

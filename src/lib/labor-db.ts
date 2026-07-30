@@ -7,6 +7,7 @@
  */
 import { getSupabaseBrowserClient } from './supabase';
 import { executeDBOperation } from './db-guard';
+import { isUuid } from './is-uuid';
 import { fetchBoardOrders } from './ops-data';
 import { MOCK_BOARD_ORDERS } from './ops-mock';
 import type { BoardOrder } from './board';
@@ -101,6 +102,12 @@ const localLabor = new Map<string, RepairOrderLaborEntry[]>([
 export async function getLaborEntries(
   repairOrderId: string,
 ): Promise<RepairOrderLaborEntry[]> {
+  // A non-UUID id (sample/fallback board data) would make the query below
+  // throw "invalid input syntax for type uuid" — not a real DB failure, so
+  // skip the round-trip entirely and go straight to the local fallback.
+  if (!isUuid(repairOrderId)) {
+    return (localLabor.get(repairOrderId) ?? []).map((e) => ({ ...e }));
+  }
   const supabase = getSupabaseBrowserClient();
   const result = await executeDBOperation<LaborRow[]>(
     'getLaborEntries',

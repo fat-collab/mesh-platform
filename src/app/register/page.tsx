@@ -12,6 +12,8 @@ import { getSupabaseBrowserClient } from '@/lib/supabase';
 
 const DEST = '/dashboard/setup';
 
+const TOS_TEXT = `SaaS Provision Only: MESH is a software-as-a-service operational tool provided 'as is' and 'as available.' MESH, its developers, and its principals disclaim all liability for financial calculations, repair order estimates, subcontractor tracking, rental reimbursements, or data loss arising from shop operations. Tenant Data Autonomy: The subscribing Organization ('Shop') maintains sole legal and regulatory responsibility for compliance, tax filings, consumer privacy, and data governance within their jurisdiction. Indemnification Shield: The Shop agrees to indemnify, defend, and hold harmless MESH and its principals from any third-party claims, subcontractor disputes, regulatory penalties, or operational losses resulting from the use of the platform.`;
+
 interface RegisterResponse {
   success?: boolean;
   error?: string;
@@ -24,6 +26,7 @@ export default function RegisterPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [agreed, setAgreed] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [checking, setChecking] = useState(true);
@@ -49,7 +52,7 @@ export default function RegisterPage() {
     return () => {
       cancelled = true;
     };
-  }, [router]);
+  }, []);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -59,13 +62,17 @@ export default function RegisterPage() {
       setError('Passwords do not match.');
       return;
     }
+    if (!agreed) {
+      setError('You must accept the Terms of Service to continue.');
+      return;
+    }
 
     setBusy(true);
     try {
       const res = await fetch('/api/v1/auth/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password, fullName, organizationName }),
+        body: JSON.stringify({ email, password, fullName, organizationName, tosAccepted: agreed }),
       });
       const result = (await res.json()) as RegisterResponse;
       if (!res.ok || !result.success) {
@@ -191,6 +198,24 @@ export default function RegisterPage() {
             />
           </div>
 
+          {/* MESH Legal Shield — click-wrap acceptance (upstream of setup) */}
+          <div>
+            <p className={labelCls}>MESH Legal Shield</p>
+            <blockquote className="max-h-40 overflow-y-auto rounded-md border border-zinc-700 bg-zinc-950 p-3 text-xs leading-relaxed text-zinc-400">
+              {TOS_TEXT}
+            </blockquote>
+            <label className="mt-2 flex items-start gap-2 text-xs text-zinc-300">
+              <input
+                type="checkbox"
+                required
+                checked={agreed}
+                onChange={(e) => setAgreed(e.target.checked)}
+                className="mt-0.5"
+              />
+              I have read and agree to the MESH Terms of Service and Legal Shield above.
+            </label>
+          </div>
+
           {error && (
             <p className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300">
               {error}
@@ -199,7 +224,7 @@ export default function RegisterPage() {
 
           <button
             type="submit"
-            disabled={busy}
+            disabled={busy || !agreed}
             className="w-full rounded-md bg-sky-600 px-3 py-2 text-sm font-semibold text-white transition-colors hover:bg-sky-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 disabled:opacity-60"
           >
             {busy ? 'Creating your shop…' : 'Create shop account'}

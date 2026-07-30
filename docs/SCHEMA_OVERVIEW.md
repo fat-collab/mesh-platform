@@ -19,9 +19,11 @@
 ### Migration application status
 `20260101000000_init_mesh.sql` was pushed & seeded to the hosted project (per
 project memory). The **incremental migrations added since** (resolution reason,
-parts, intake leads, rental vehicles) have **not** been applied to the hosted DB
-(no DDL access here), so those features currently run in **local/fallback mode**
-until applied via the Supabase SQL editor or `supabase db push`.
+parts, intake leads, rental vehicles, the Catastrophe Hub columns +
+`commission_overrides`, the Legal & Carrier Intelligence Shield columns +
+`remote_aob_links`) have **not** been applied to the hosted DB (no DDL access
+here), so those features currently run in **local/fallback mode** until
+applied via the Supabase SQL editor or `supabase db push`.
 
 ---
 
@@ -75,6 +77,52 @@ from stage), `compute_risk_score` / `net_payout` derivations, RO-child
 > fuel_level, assigned_ro_id, assigned_customer, assigned_agent,
 > expected_return_date, updated_at
 
+**`intake_leads` — Catastrophe Hub columns** (`20260730010000_catastrophe_hub.sql`)
+> channel (CHECK: DIGITAL_INBOUND / FIELD_DISPATCH — which Sales & Intake hub
+> tab a lead belongs to; existing rows backfilled to DIGITAL_INBOUND),
+> storm_tag, zip_code (storm/campaign attribution), severity (CHECK: MINOR /
+> MODERATE / SEVERE / CATASTROPHIC — instant digital-intake rating),
+> damage_photos (jsonb, `IntakeDocumentRef[]`), routing_path (CHECK:
+> SHOP_DROPOFF / MOBILE_HOUSE_CALL — the post-contact dual-path routing
+> decision), dispatch_staff_name, dispatch_status (CHECK: DISPATCHED /
+> EN_ROUTE / ON_SITE / COMPLETED — field dispatch lifecycle, mobile path only).
+
+**`commission_overrides`** (`20260730010000_catastrophe_hub.sql`) — executive
+override layer over `payout_splits.tech_split_pct` (SALES legs)
+> id, organization_id (FK → organizations, nullable), user_id (text, not a
+> FK — staff ids in this app are free-text, e.g. 'staff-avery'), ro_id (text,
+> not a FK — local/demo ROs carry non-uuid ids, e.g. 'mock-a6f1'), split_role
+> (`payout_split_role`, default SALES), override_pct, set_by, created_at,
+> updated_at. CHECK requires at least one of user_id / ro_id. RLS: select
+> open (authenticated + anon); insert/update/delete require
+> `current_user_is('EXECUTIVE')`. A reporting/override view only — never
+> mutates the underlying `payout_splits` row.
+
+**`intake_leads` — Legal & Carrier Intelligence Shield columns**
+(`20260730020000_legal_carrier_shield.sql`)
+> policyholder_match (boolean, default true — Named Insured / Policyholder
+> Match), proxy_policyholder (jsonb — `ProxyPolicyholder`, set when match is
+> false), remote_aob_status (CHECK: NOT_SENT / SENT / SIGNED), remote_aob_token
+> (the active `remote_aob_links.token` for this lead, if any). Carrier
+> lowball/supplement risk profiles and the dynamic per-carrier photo
+> checklist (VIN-to-damage alignment, line-board sweep, etc.) are static
+> in-code reference data (`src/lib/carrier-intel.ts`), not persisted — the
+> captured checklist photos land in `intake_leads.documents` like any other
+> `IntakeDocumentRef`.
+
+**`remote_aob_links`** (`20260730020000_legal_carrier_shield.sql`) — Remote
+AOB Secure Signing Link
+> token (text, primary key — the URL slug), lead_id (text, not a FK — same
+> non-uuid-safe reasoning as `commission_overrides.ro_id`), organization_id
+> (FK → organizations, nullable), proxy_full_name, proxy_relationship,
+> proxy_phone, proxy_email, status (CHECK: PENDING / SIGNED / EXPIRED),
+> signature_url, created_at, signed_at. RLS is permissive to `anon` by
+> design — the off-site proxy policyholder who opens `/remote-aob/[token]`
+> has no MESH account, so the token itself (not a session) is the security
+> boundary. Signing calls the same `updateLeadStatus(..., 'AOB_SIGNED')`
+> business rule the in-person mobile wizard triggers on-site, so the
+> auto-convert-to-RO rule fires identically regardless of signing path.
+
 **`order_assignments`** (`20260727000000`) — relational RO staffing (multi-role)
 > id, repair_order_id (FK → repair_orders), staff_id, staff_name,
 > role (`staff_role` enum: SALES / ESTIMATOR / BODY_TECH / PAINTER / FOREMAN),
@@ -118,18 +166,23 @@ from stage), `compute_risk_score` / `net_payout` derivations, RO-child
 > created_at. Inbound/outbound customer-comms timeline; models
 > `RepairOrderCommEntry` in `ro-comms-types.ts` (DAL: `comms-db.ts`).
 
-### Inventory & vendors (`20260728000700_inventory.sql`)
-Shop-level parts inventory & procurement (distinct from the RO-scoped
-`repair_order_parts`). DAL: `inventory-db.ts`; types: `inventory-types.ts`.
+### Procurement — pure job-costing (`20260728000700` + `20260730000000_inventory_lockdown.sql`)
+⚠ **The generalized warehouse catalog was removed** (`20260730000000_inventory_lockdown.sql`,
+"Downstream Lockdown"): `suppliers`, `parts_catalog`, `supplier_parts`, and
+`purchase_order_items.part_id` are all **dropped**. No SKU/stock-level
+inventory concept exists in this app — every part line item is strictly
+coupled to a repair order. DAL: `procurement-db.ts`; types: `procurement-types.ts`.
 
-**`suppliers`** — id, name, contact, lead_time_days.
-**`parts_catalog`** — id, sku (unique), name, category, min_stock, current_stock.
-**`supplier_parts`** — supplier_id + part_id (composite PK, both FK), supplier_sku,
-> wholesale_price, preferred. The supplier×part price matrix.
-**`purchase_orders`** — id, supplier_id (FK), status (CHECK: DRAFT / SENT / RECEIVED),
-> created_at.
-**`purchase_order_items`** — id, po_id (FK → purchase_orders), part_id (FK →
-> parts_catalog), quantity, unit_price.
+**`purchase_orders`** — id, repair_order_id (uuid, FK → repair_orders, **NOT
+> NULL**, ON DELETE CASCADE), vin (text, **NOT NULL** — a snapshot captured
+> from the RO's vehicle at PO-creation time, not live-joined, so it won't drift
+> if the vehicle record is later edited), status (CHECK: DRAFT / SENT /
+> RECEIVED), created_at. `generatePurchaseOrder()` throws if either
+> repair_order_id or vin is missing — enforced in both the DB and
+> local-fallback paths (job-costing gate).
+**`purchase_order_items`** — id, po_id (FK → purchase_orders), part_line_id
+> (FK → parts_line_items, nullable — the claim-scoped estimate line this PO
+> line fulfills), quantity, unit_price.
 
 **`supplement_records`** (`20260728000900`) — canonical carrier supplement claims
 > id (text, app-generated), ro_id, customer_name, vehicle_info, insurance_carrier,
@@ -158,8 +211,10 @@ Shop-level parts inventory & procurement (distinct from the RO-scoped
 | RO labor / time tracking | `repair_order_labor` | session store in `labor-db` (keyed by RO id, seeded for `mock-a6f1`) |
 | RO invoicing / A/R | `repair_order_invoices` | session store in `invoice-db` (one per RO, seeded for `mock-a6f1`) |
 | RO customer comms | `repair_order_comms` | session store in `comms-db` (keyed by RO id, seeded for `mock-a6f1`) |
-| Inventory & vendors | `suppliers`, `parts_catalog`, `supplier_parts`, `purchase_orders`, `purchase_order_items` | seeded in-memory stores in `inventory-db` |
+| Procurement (job-costing) | `purchase_orders`, `purchase_order_items` | seeded in-memory store in `procurement-db` (keyed by RO id, seeded for `mock-a6f1`) |
 | Rental fleet | `rental_vehicles` | session store in `rental-db` (seeded from `MOCK_FLEET`) |
+| Commission overrides (Catastrophe Hub) | `commission_overrides` | session store in `commission-db` |
+| Remote AOB signing links | `remote_aob_links` | session store in `remote-aob-db` (keyed by token) |
 | Carrier supplements (canonical) | `supplement_records` (`20260728000900`) | session store in `supplement-db` — feeds RO drawer, invoicing, analytics, stage-gates |
 | Shop config | *(none yet)* | temp-dir JSON `mesh-shop-config.json` |
 | Comms audit ledger | *(none yet)* | temp-dir JSON `mesh-audit-ledger.json` |
@@ -173,13 +228,16 @@ Shop-level parts inventory & procurement (distinct from the RO-scoped
 |---|---|
 | `ops-data.ts` | mapRowToBoardOrder, fetchBoardOrders, persistStage, persistUnlock |
 | `ops-db.ts` | fetchPartsByClaim, importEstimateLineItems, updatePartStatus, markPartReceived, flagPartDiscrepancy, fetchHoldGateLogs, getSupplementsForClaim, saveSupplementPackage |
-| `sales-db.ts` | getLeads, saveIntakePackage, updateLeadStatus, assignLeadStaff, convertLeadToRO, resurrectAndConvertLead |
+| `sales-db.ts` | getLeads, saveIntakePackage, createDigitalLead, updateLeadStatus, updateLeadRouting, updateDispatchStatus, assignLeadStaff, markRemoteAobDispatched, convertLeadToRO, resurrectAndConvertLead |
+| `commission-db.ts` | getCommissionLedger, getCommissionOverrides, setCommissionOverride |
+| `carrier-intel.ts` | getCarrierIntel, CHECKLIST_ITEM_LABEL (carrier lowball/supplement risk + dynamic photo checklist — distinct from carrier-tiers.ts's FNOL automation tier) |
+| `remote-aob-db.ts` | createRemoteAobLink, getRemoteAobLink, signRemoteAobLink |
 | `assignments-db.ts` | getAssignments, assignStaff, removeAssignment |
 | `parts-db.ts` | getParts, addPart, updatePartStatus, removePart |
 | `labor-db.ts` | getLaborEntries, addLaborEntry, toggleClock, updateActualHours, removeLaborEntry |
 | `invoice-db.ts` | getInvoice, generateInvoice, updateInvoiceStatus |
 | `comms-db.ts` | getCommEntries, addCommEntry |
-| `inventory-db.ts` | getCatalogItems, getSupplierPriceMatrix, createPurchaseOrder, updateStockLevel |
+| `procurement-db.ts` | getPartsRequestQueue, getActivePurchaseOrders, generatePurchaseOrder, updatePurchaseOrderStatus |
 | `stage-gates.ts` | validateStageTransition |
 | `rental-db.ts` | getFleet, getAvailableVehicles, assignVehicle, addVehicle, removeVehicle, returnVehicle, setVehicleStatus |
 | `supplement-db.ts` | getSupplements, getSupplementsForRO, approvedSupplementTotal, saveSupplement, deleteSupplement, updateSupplementStatus, getAgingSupplements, supplementAgingDays, computeTotalDelta, genSupplementId |
@@ -204,8 +262,10 @@ Shop-level parts inventory & procurement (distinct from the RO-scoped
 | `src/components/ops/ro-labor-types.ts` | LaborStatus, RepairOrderLaborEntry |
 | `src/components/ops/ro-invoice-types.ts` | InvoiceStatus, RepairOrderInvoice |
 | `src/components/ops/ro-comms-types.ts` | CommChannel, CommDirection, RepairOrderCommEntry |
-| `src/components/inventory/inventory-types.ts` | PurchaseOrderStatus, Supplier, CatalogItem, SupplierPartMatrix, POItem, PurchaseOrder |
-| `src/components/sales/types.ts` | LeadStatus, IntakeLead, RentalStatus, RentalVehicle, RentalAssignmentInfo, IntakeDocKind, IntakeDocumentRef, WalkaroundItem, HailSeverity, HailPanelAssessment, IntakeSubmission |
+| `src/components/inventory/procurement-types.ts` | ProcurementPOStatus, PartsRequestGroup, ProcurementPOItem, ProcurementPO |
+| `src/components/sales/types.ts` | LeadStatus, IntakeLead, LeadChannel, StormSeverity, RoutingPath, DispatchStatus, ProxyPolicyholder, RemoteAobStatus, RentalStatus, RentalVehicle, RentalAssignmentInfo, IntakeDocKind, IntakeDocumentRef, WalkaroundItem, HailSeverity, HailPanelAssessment, IntakeSubmission |
+| `src/lib/carrier-intel.ts` | LowballRisk, ChecklistItemId, CarrierIntel |
+| `src/lib/remote-aob-db.ts` | RemoteAobLinkStatus, RemoteAobLinkRecord |
 | `src/components/supplements/types.ts` | SupplementItemCategory, SupplementItemStatus, SupplementItem, SupplementLifecycle, SupplementRecord |
 | `src/components/onboarding/types.ts` | StaffMember, PdrMatrixRow, OperatingHours, ShopConfig |
 | `src/lib/audit/types.ts` | AuditChannel, AuditDirection, AuditLogEntry (comms ledger) |
@@ -234,9 +294,12 @@ Shop-level parts inventory & procurement (distinct from the RO-scoped
 | `GET  /api/v1/audit/[claimId]` | Fetch audit timeline for a record |
 | `GET/POST /api/v1/shop/config` | Shop profile & SOP config |
 | `POST /api/v1/sales/leads/[leadId]/convert` | Convert approved lead → Ops RO |
+| `POST /api/v1/sales/leads/[leadId]/remote-aob` | Create + email-dispatch a Remote AOB Secure Signing Link (Resend; SMS is mock-logged — no SMS provider exists in this app) |
 | `POST /api/v1/payments/verify` | Proof-of-payment verification (Stripe/Supabase) |
 
 Dashboard pages: `/dashboard/{ops, sales, fleet, supplements, rebuttals, payouts, settings}`.
+Public pages (no auth, outside the dashboard tree): `/remote-aob/[token]` — the
+proxy policyholder's Remote AOB Execution Gate.
 
 ---
 
@@ -246,6 +309,7 @@ Dashboard pages: `/dashboard/{ops, sales, fleet, supplements, rebuttals, payouts
 |---|---|
 | `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` | browser Supabase client |
 | `SUPABASE_SERVICE_ROLE_KEY` | server/seed scripts |
+| `RESEND_API_KEY` / `RESEND_FROM_EMAIL` | Resend email — register welcome email, Remote AOB signing-link dispatch (skipped/logged if unset) |
 | `GEMINI_API_KEY` | vision OCR (else deterministic mock) |
 | `VAPI_API_KEY` | outbound calls (else mock) |
 | `VAPI_PHONE_NUMBER_ID`, `VAPI_ASSISTANT_ID`, `VAPI_ASSISTANT_SUPPLEMENT`, `VAPI_ASSISTANT_ACV` | call dispatch config |

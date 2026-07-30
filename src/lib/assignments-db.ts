@@ -7,6 +7,7 @@
  * the DB-first + fallback pattern used across the other per-feature DALs.
  */
 import { getSupabaseBrowserClient } from './supabase';
+import { isUuid } from './is-uuid';
 import { executeDBOperation } from './db-guard';
 import type { OrderAssignment, StaffRole } from '@/components/ops/types';
 
@@ -77,6 +78,12 @@ const localAssignments = new Map<string, OrderAssignment[]>([
 
 /** Loads all staff assignments for a repair order (DB when available, else local). */
 export async function getAssignments(repairOrderId: string): Promise<OrderAssignment[]> {
+  // A non-UUID id (sample/fallback board data) would make the query below
+  // throw "invalid input syntax for type uuid" — not a real DB failure, so
+  // skip the round-trip entirely and go straight to the local fallback.
+  if (!isUuid(repairOrderId)) {
+    return (localAssignments.get(repairOrderId) ?? []).map((a) => ({ ...a }));
+  }
   const supabase = getSupabaseBrowserClient();
   const result = await executeDBOperation<AssignmentRow[]>(
     'getAssignments',

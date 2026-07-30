@@ -2,6 +2,12 @@
  * MESH Procurement — data access bridging RO parts (parts_line_items) to
  * purchase orders (purchase_orders / purchase_order_items).
  *
+ * Pure job-costing engine: every PO is strictly coupled to a repair order
+ * (repair_order_id) and a VIN snapshot — there is no generalized warehouse
+ * SKU/stock catalog in this app. generatePurchaseOrder enforces this: it
+ * throws if either is missing, in both the DB and local-fallback paths, so
+ * the rule holds regardless of connectivity.
+ *
  * Aggregates un-ordered parts across active repair orders (the Parts Request
  * Queue), raises a PO for an RO's needed parts (flipping them NEEDED → ORDERED),
  * and lists active POs tied back to their RO. DB-first with a session-local
@@ -28,13 +34,15 @@ function genId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.round(Math.random() * 1e6)}`;
 }
 
-// Session-local PO store (fallback + demo). Seeded with one active PO tied to a
-// claim so the Active POs tab is demonstrable offline.
+// Session-local PO store (fallback + demo). Seeded with one active PO tied to
+// a repair order + VIN so the Active POs tab is demonstrable offline.
 const localPOs: ProcurementPO[] = [
   {
     id: 'po-seed-0001',
+    repairOrderId: 'mock-a6f1',
+    vin: '1FTFW1E80MFA10023',
     claimNumber: 'APX-2026-0001',
-    supplierId: null,
+    customerName: 'Dana Whitfield',
     status: 'SENT',
     createdAt: '2026-07-26T15:00:00.000Z',
     items: [
@@ -75,9 +83,11 @@ export async function getPartsRequestQueue(): Promise<PartsRequestGroup[]> {
     const parts = partsForClaim(claim, items).filter((p) => p.status === 'NEEDED');
     if (parts.length > 0) {
       groups.push({
+        repairOrderId: ro.id,
         claimNumber: claim,
         customerName: ro.customer_name,
         vehicle: ro.vehicle,
+        vin: ro.vin ?? null,
         parts,
       });
     }
@@ -87,10 +97,11 @@ export async function getPartsRequestQueue(): Promise<PartsRequestGroup[]> {
 
 interface PODbRow {
   id: string;
-  claim_number: string | null;
-  supplier_id: string | null;
+  repair_order_id: string;
+  vin: string;
   status: ProcurementPOStatus;
   created_at: string;
+  repair_orders: { claim_number: string | null; customer_name: string | null } | null;
   purchase_order_items:
     | {
         id: string;
@@ -102,25 +113,27 @@ interface PODbRow {
     | null;
 }
 
-/** Lists purchase orders tied to a repair order (claim), newest first. */
+/** Lists purchase orders tied to their repair order, newest first. */
 export async function getActivePurchaseOrders(): Promise<ProcurementPO[]> {
   try {
     const supabase = getSupabaseBrowserClient();
     const res = await supabase
       .from('purchase_orders')
       .select(
-        `id, claim_number, supplier_id, status, created_at,
+        `id, repair_order_id, vin, status, created_at,
+         repair_orders ( claim_number, customer_name ),
          purchase_order_items ( id, part_line_id, quantity, unit_price,
            parts_line_items ( description, part_number ) )`,
       )
-      .not('claim_number', 'is', null)
       .order('created_at', { ascending: false });
     const rows = res.data as unknown as PODbRow[] | null;
     if (!res.error && rows && rows.length > 0) {
       return rows.map((r) => ({
         id: r.id,
-        claimNumber: r.claim_number ?? '',
-        supplierId: r.supplier_id,
+        repairOrderId: r.repair_order_id,
+        vin: r.vin,
+        claimNumber: r.repair_orders?.claim_number ?? null,
+        customerName: r.repair_orders?.customer_name ?? null,
         status: r.status,
         createdAt: r.created_at,
         items: (r.purchase_order_items ?? []).map<ProcurementPOItem>((it) => ({
@@ -153,11 +166,29 @@ async function flipToOrdered(parts: PartsLineItem[]): Promise<void> {
   }
 }
 
-/** Raises a PO for a repair order's needed parts, then marks them ORDERED. */
+/**
+ * Raises a PO for a repair order's needed parts, then marks them ORDERED.
+ *
+ * Job-costing enforcement: throws if repairOrderId or vin is missing/blank —
+ * in BOTH the DB and local-fallback paths, so an RO with no vehicle/VIN can
+ * never generate a PO regardless of connectivity.
+ */
 export async function generatePurchaseOrder(
-  claimNumber: string,
+  repairOrderId: string,
+  vin: string,
+  claimNumber: string | null,
+  customerName: string | null,
   parts: PartsLineItem[],
 ): Promise<ProcurementPO> {
+  if (!repairOrderId.trim()) {
+    throw new Error('Cannot generate a purchase order: no repair order reference.');
+  }
+  if (!vin || !vin.trim()) {
+    throw new Error(
+      'Cannot generate a purchase order: this repair order has no VIN on file. Attach a vehicle first.',
+    );
+  }
+
   const lines = parts.map((p) => ({
     partLineId: p.id ?? null,
     name: p.name,
@@ -171,13 +202,14 @@ export async function generatePurchaseOrder(
     const supabase = getSupabaseBrowserClient();
     const { data, error } = await supabase
       .from('purchase_orders')
-      .insert({ claim_number: claimNumber, status: 'DRAFT' })
-      .select('id, claim_number, supplier_id, status, created_at')
+      .insert({ repair_order_id: repairOrderId, vin, status: 'DRAFT' })
+      .select('id, repair_order_id, vin, status, created_at')
       .single();
     if (!error && data) {
       const row = data as {
         id: string;
-        supplier_id: string | null;
+        repair_order_id: string;
+        vin: string;
         status: ProcurementPOStatus;
         created_at: string;
       };
@@ -197,8 +229,10 @@ export async function generatePurchaseOrder(
         [];
       po = {
         id: row.id,
+        repairOrderId: row.repair_order_id,
+        vin: row.vin,
         claimNumber,
-        supplierId: row.supplier_id,
+        customerName,
         status: row.status,
         createdAt: row.created_at,
         items: insertedRows.map<ProcurementPOItem>((r, i) => ({
@@ -217,8 +251,10 @@ export async function generatePurchaseOrder(
   if (!po) {
     po = {
       id: genId('po'),
+      repairOrderId,
+      vin,
       claimNumber,
-      supplierId: null,
+      customerName,
       status: 'DRAFT',
       createdAt: new Date().toISOString(),
       items: lines.map<ProcurementPOItem>((l) => ({

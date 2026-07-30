@@ -115,6 +115,55 @@ export async function persistStage(
   return { error: error?.message ?? null };
 }
 
+export interface ManualIntakeInput {
+  customerName: string;
+  vehicle: string;
+  vin?: string | null;
+  claimNumber?: string | null;
+  insuranceCarrier?: string | null;
+  intakeNotes?: string | null;
+  organizationId: string;
+}
+
+/**
+ * Creates a repair order directly from the Ops intake modal (provisions a
+ * vehicle row, then the RO), for manual intake / "Pull from Sales" entries
+ * that aren't going through the sales-lead conversion pipeline. Real-DB only —
+ * callers fall back to the local board when this throws or when not
+ * DB-backed.
+ */
+export async function createManualIntake(
+  supabase: MeshSupabaseClient,
+  input: ManualIntakeInput,
+): Promise<{ id: string; error: string | null }> {
+  const { data: vehicle, error: vehicleError } = await supabase
+    .from('vehicles')
+    .insert({ organization_id: input.organizationId, vin: input.vin || null, model: input.vehicle })
+    .select('id')
+    .single();
+  if (vehicleError || !vehicle) {
+    return { id: '', error: vehicleError?.message ?? 'Vehicle provisioning failed.' };
+  }
+
+  const { data: ro, error: roError } = await supabase
+    .from('repair_orders')
+    .insert({
+      organization_id: input.organizationId,
+      vehicle_id: (vehicle as { id: string }).id,
+      customer_name: input.customerName,
+      claim_number: input.claimNumber || null,
+      stage: 'INTAKE',
+      hold_gate_active: false,
+    })
+    .select('id')
+    .single();
+  if (roError || !ro) {
+    return { id: '', error: roError?.message ?? 'Repair order creation failed.' };
+  }
+
+  return { id: (ro as { id: string }).id, error: null };
+}
+
 /**
  * Persists an edit to a repair order's core fields (customer / claim / stage).
  * Only the provided keys are written; `updated_at` is stamped alongside.

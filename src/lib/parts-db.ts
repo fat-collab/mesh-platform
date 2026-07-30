@@ -7,6 +7,7 @@
  * pattern of assignments-db.ts.
  */
 import { getSupabaseBrowserClient } from './supabase';
+import { isUuid } from './is-uuid';
 import { executeDBOperation } from './db-guard';
 import type { PartStatus, PartType, RepairOrderPart } from '@/components/ops/ro-parts-types';
 
@@ -108,6 +109,12 @@ const localParts = new Map<string, RepairOrderPart[]>([
 
 /** Loads all parts for a repair order (DB when available, else local). */
 export async function getParts(repairOrderId: string): Promise<RepairOrderPart[]> {
+  // A non-UUID id (sample/fallback board data) would make the query below
+  // throw "invalid input syntax for type uuid" — not a real DB failure, so
+  // skip the round-trip entirely and go straight to the local fallback.
+  if (!isUuid(repairOrderId)) {
+    return (localParts.get(repairOrderId) ?? []).map((p) => ({ ...p }));
+  }
   const supabase = getSupabaseBrowserClient();
   const result = await executeDBOperation<PartRow[]>(
     'getParts',

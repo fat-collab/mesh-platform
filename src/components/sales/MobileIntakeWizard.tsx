@@ -9,14 +9,19 @@
  * an HTML5 canvas e-signature, (5) submit → persists the intake package and
  * creates an active lead via sales-db.
  */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { clsx } from 'clsx';
 import { parseEstimate } from '@/lib/estimate-parser';
 import { saveIntakePackage } from '@/lib/sales-db';
+import { importEstimateLineItems } from '@/lib/ops-db';
 import { assignVehicle, getAvailableVehicles } from '@/lib/rental-db';
 import { getCurrentProfile } from '@/lib/auth';
 import { getSupabaseBrowserClient } from '@/lib/supabase';
 import { CarrierTierBadge } from '@/components/carrier/CarrierTierBadge';
+import { getCarrierIntel, CHECKLIST_ITEM_LABEL, type ChecklistItemId } from '@/lib/carrier-intel';
+import { resolveRentalOperator, type RentalOperatorBinding } from '@/lib/agreement-engine';
+import { SignaturePad } from './SignaturePad';
+import { AobAgreementText } from './AobAgreementText';
 import type { PartsLineItem } from '@/components/ops/types';
 import type {
   HailPanelAssessment,
@@ -25,97 +30,25 @@ import type {
   IntakeDocumentRef,
   IntakeLead,
   IntakeSubmission,
+  ProxyPolicyholder,
   RentalAssignmentInfo,
   RentalVehicle,
   WalkaroundItem,
 } from './types';
 
-// --- signature pad ----------------------------------------------------------
-
-function SignaturePad({ onChange }: { onChange: (dataUrl: string | null) => void }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-  const drawing = useRef(false);
-  const dirty = useRef(false);
-
-  const point = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    const c = ref.current;
-    if (!c) return { x: 0, y: 0 };
-    const r = c.getBoundingClientRect();
-    return {
-      x: (e.clientX - r.left) * (c.width / r.width),
-      y: (e.clientY - r.top) * (c.height / r.height),
-    };
-  };
-
-  const start = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    const c = ref.current;
-    if (!c) return;
-    c.setPointerCapture(e.pointerId);
-    drawing.current = true;
-    const ctx = c.getContext('2d');
-    if (!ctx) return;
-    const { x, y } = point(e);
-    ctx.beginPath();
-    ctx.moveTo(x, y);
-  };
-
-  const move = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!drawing.current) return;
-    const c = ref.current;
-    const ctx = c?.getContext('2d');
-    if (!c || !ctx) return;
-    const { x, y } = point(e);
-    ctx.lineTo(x, y);
-    ctx.strokeStyle = '#e4e4e7';
-    ctx.lineWidth = 2.2;
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    ctx.stroke();
-    dirty.current = true;
-  };
-
-  const end = () => {
-    if (!drawing.current) return;
-    drawing.current = false;
-    if (dirty.current && ref.current) onChange(ref.current.toDataURL('image/png'));
-  };
-
-  const clear = () => {
-    const c = ref.current;
-    const ctx = c?.getContext('2d');
-    if (!c || !ctx) return;
-    ctx.clearRect(0, 0, c.width, c.height);
-    dirty.current = false;
-    onChange(null);
-  };
-
-  return (
-    <div className="space-y-1.5">
-      <canvas
-        ref={ref}
-        width={560}
-        height={180}
-        onPointerDown={start}
-        onPointerMove={move}
-        onPointerUp={end}
-        onPointerLeave={end}
-        className="h-40 w-full touch-none rounded-md border border-zinc-600 bg-zinc-950"
-      />
-      <div className="flex items-center justify-between">
-        <span className="text-[11px] text-zinc-500">Sign above with finger or stylus</span>
-        <button
-          type="button"
-          onClick={clear}
-          className="rounded border border-zinc-700 px-2 py-0.5 text-[11px] text-zinc-300 hover:bg-zinc-800"
-        >
-          Clear
-        </button>
-      </div>
-    </div>
-  );
-}
-
 // --- config -----------------------------------------------------------------
+
+// Rigorous alphanumeric mask for the captured VIN segment. This field models
+// VIN-last-8 throughout the app (mock OCR data, DB column semantics, display
+// labels) rather than a full 17-char VIN, so validation targets its actual
+// established length: exactly 8 alphanumeric characters, or empty (optional).
+const VIN_SEGMENT_LENGTH = 8;
+const VIN_SEGMENT_RE = new RegExp(`^[A-Z0-9]{${VIN_SEGMENT_LENGTH}}$`);
+const sanitizeVinSegment = (raw: string) =>
+  raw
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+    .slice(0, VIN_SEGMENT_LENGTH);
 
 const HAIL_PANELS = ['Roof', 'Hood', 'Trunk', 'Fenders', 'Doors', 'Pillars'] as const;
 const HAIL_SEVERITIES: HailSeverity[] = ['NONE', 'LIGHT', 'MODERATE', 'SEVERE'];
@@ -175,6 +108,14 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
   const [assignedStaffName, setAssignedStaffName] = useState('');
   const [assignedStaffId, setAssignedStaffId] = useState<string | undefined>(undefined);
 
+  // Policyholder Identity Split — defaults to Yes (person at intake IS the
+  // Named Insured). Toggling No captures a proxy for the Remote AOB gate.
+  const [policyholderMatch, setPolicyholderMatch] = useState(true);
+  const [proxyFullName, setProxyFullName] = useState('');
+  const [proxyRelationship, setProxyRelationship] = useState('');
+  const [proxyPhone, setProxyPhone] = useState('');
+  const [proxyEmail, setProxyEmail] = useState('');
+
   // Step 2
   const [policyNumber, setPolicyNumber] = useState('');
   const [estimatedAmount, setEstimatedAmount] = useState('');
@@ -184,6 +125,11 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
     INSURANCE_CARD: null,
     PRIOR_ESTIMATE: null,
     WALKAROUND: null,
+    DAMAGE_PHOTO: null,
+    VIN_TO_DAMAGE_ALIGNMENT: null,
+    LINE_BOARD_SWEEP: null,
+    FOUR_CORNER_PHOTOS: null,
+    UNDERSIDE_BRACING_SHOTS: null,
   });
   const [parsedItems, setParsedItems] = useState<PartsLineItem[]>([]);
   const [parseMsg, setParseMsg] = useState<string | null>(null);
@@ -248,6 +194,29 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
 
   const input =
     'w-full rounded-md border border-zinc-700 bg-zinc-950/70 px-2.5 py-1.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500/60 focus:outline-none focus:ring-1 focus:ring-sky-500/40';
+
+  // Dynamic per-carrier required documentation (Carrier Intelligence layer).
+  const carrierChecklist: ChecklistItemId[] = getCarrierIntel(insuranceCarrier).requiredChecklist;
+
+  // Agreement Auto-Population Engine — binds the Rental Fleet Agreement to
+  // whoever is actually taking possession of the loaner (the on-site proxy,
+  // when the Named Insured isn't present, rather than the absent policyholder).
+  const rentalOperator = resolveRentalOperator({
+    policyholderMatch,
+    proxyPolicyholder: policyholderMatch
+      ? null
+      : { fullName: proxyFullName, relationship: proxyRelationship, phone: proxyPhone, email: proxyEmail },
+    customerName,
+    phone,
+    email,
+    documents: docs,
+  });
+
+  // A proxy who isn't the Named Insured still takes physical custody of a
+  // loaner, so the Rental Fleet Agreement (bound to them, above) needs an
+  // on-site signature even though the main repair AOB defers to the Remote
+  // AOB Execution Gate.
+  const requiresOnSiteSignature = policyholderMatch || (provideLoaner && rentalOperator.source === 'PROXY');
 
   const setDoc = (kind: IntakeDocKind, file: File | undefined) => {
     if (!file) return;
@@ -315,7 +284,7 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
         if (typeof d.year === 'number') setVehicleYear(String(d.year));
         if (typeof d.make === 'string') setVehicleMake(d.make);
         if (typeof d.model === 'string') setVehicleModel(d.model);
-        if (typeof d.vinLast8 === 'string') setVinLast8(d.vinLast8);
+        if (typeof d.vinLast8 === 'string') setVinLast8(sanitizeVinSegment(d.vinLast8));
         setScanMsg(`✓ Autofilled vehicle from VIN (${src}).`);
       } else {
         if (typeof d.carrier === 'string') setInsuranceCarrier(d.carrier);
@@ -332,13 +301,33 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
   };
 
   const canProceed = (): boolean => {
-    if (step === 1) return customerName.trim() !== '' && phone.trim() !== '';
+    if (step === 1) {
+      return (
+        customerName.trim() !== '' &&
+        phone.trim() !== '' &&
+        (vinLast8 === '' || VIN_SEGMENT_RE.test(vinLast8)) &&
+        (policyholderMatch || proxyFullName.trim() !== '')
+      );
+    }
+    if (step === 2) {
+      // Driver's License, Insurance Card, and Prior Estimate are optional —
+      // a rep can push the lead forward instantly and fill them in later.
+      // The dynamic carrier-risk checklist stays mandatory (compliance gate,
+      // unaffected by this relaxation).
+      return carrierChecklist.every((kind) => docs[kind] !== null);
+    }
     if (step === 4) return !provideLoaner || selectedVehicleId !== null;
-    if (step === 5) return signatureDataUrl !== null && agreed;
+    if (step === 5) return !requiresOnSiteSignature || (signatureDataUrl !== null && agreed);
     return true;
   };
 
   const submit = async () => {
+    // Defensive re-check — blocks an invalid VIN length before the payload is
+    // built/sent, regardless of how the wizard's step gate was reached.
+    if (vinLast8 !== '' && !VIN_SEGMENT_RE.test(vinLast8)) {
+      setScanMsg(`VIN segment must be exactly ${VIN_SEGMENT_LENGTH} alphanumeric characters.`);
+      return;
+    }
     setSubmitting(true);
     try {
       const documents = (Object.keys(docs) as IntakeDocKind[])
@@ -364,6 +353,15 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
             }
           : null;
 
+      const proxyPolicyholder: ProxyPolicyholder | null = policyholderMatch
+        ? null
+        : {
+            fullName: proxyFullName.trim(),
+            relationship: proxyRelationship.trim(),
+            phone: proxyPhone.trim(),
+            email: proxyEmail.trim(),
+          };
+
       const submission: IntakeSubmission = {
         customerName: customerName.trim(),
         phone: phone.trim(),
@@ -383,10 +381,27 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
         assignedStaffId,
         assignedStaffName: assignedStaffName.trim() || undefined,
         rental,
-        signatureDataUrl: signatureDataUrl ?? '',
+        // Remote path: no on-site signature is collected for the main repair
+        // AOB — the policyholder signs later via the Remote AOB Execution
+        // Gate. A proxy taking custody of a loaner still signs the Rental
+        // Fleet Agreement on-site (requiresOnSiteSignature covers both cases).
+        signatureDataUrl: requiresOnSiteSignature ? signatureDataUrl ?? '' : '',
         agreementAcceptedAt: new Date().toISOString(),
+        policyholderMatch,
+        proxyPolicyholder,
       };
       const lead = await saveIntakePackage(submission);
+
+      // Bind the initial insurance estimate to the supplement audit data
+      // pipeline — best-effort; a parse/import failure never blocks intake.
+      if (parsedItems.length > 0 && submission.claimNumber) {
+        try {
+          await importEstimateLineItems(submission.claimNumber, parsedItems);
+        } catch (err) {
+          console.warn('[MobileIntakeWizard] estimate import failed:', err);
+        }
+      }
+
       // Dual-agreement: assign the loaner against the new lead so the office
       // fleet dashboard reflects it as RENTED.
       if (rental) {
@@ -399,7 +414,28 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
           expectedReturnDate: rental.expectedReturnDate || null,
         });
       }
-      onComplete(lead);
+
+      // Remote AOB Execution Gate: dispatch the secure signing link. Best-
+      // effort — a dispatch failure doesn't block the lead from being created.
+      // The dispatch result is folded into the lead handed to onComplete so
+      // the board's notice can reflect it accurately.
+      let finalLead = lead;
+      if (proxyPolicyholder) {
+        try {
+          const res = await fetch(`/api/v1/sales/leads/${lead.id}/remote-aob`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ proxy: proxyPolicyholder }),
+          });
+          if (!res.ok) throw new Error(`Dispatch failed (${res.status})`);
+          const { token } = (await res.json()) as { token: string };
+          finalLead = { ...lead, remoteAobStatus: 'SENT', remoteAobToken: token };
+        } catch (err) {
+          console.warn('[MobileIntakeWizard] remote AOB dispatch failed:', err);
+        }
+      }
+
+      onComplete(finalLead);
     } finally {
       setSubmitting(false);
     }
@@ -479,12 +515,98 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                 <input className={input} placeholder="Make" value={vehicleMake} onChange={(e) => setVehicleMake(e.target.value)} />
                 <input className={input} placeholder="Model" value={vehicleModel} onChange={(e) => setVehicleModel(e.target.value)} />
               </div>
-              <input className={input} placeholder="VIN (last 8)" value={vinLast8} onChange={(e) => setVinLast8(e.target.value)} />
+              <input
+                className={input}
+                placeholder="VIN (last 8)"
+                inputMode="text"
+                maxLength={VIN_SEGMENT_LENGTH}
+                value={vinLast8}
+                onChange={(e) => setVinLast8(sanitizeVinSegment(e.target.value))}
+                aria-invalid={vinLast8 !== '' && !VIN_SEGMENT_RE.test(vinLast8)}
+              />
+              {vinLast8 !== '' && !VIN_SEGMENT_RE.test(vinLast8) && (
+                <p className="text-[11px] text-amber-400">
+                  VIN segment must be exactly {VIN_SEGMENT_LENGTH} alphanumeric characters.
+                </p>
+              )}
               <div className="grid grid-cols-2 gap-2">
                 <input className={input} placeholder="Claim #" value={claimNumber} onChange={(e) => setClaimNumber(e.target.value)} />
                 <input className={input} placeholder="Insurance carrier" value={insuranceCarrier} onChange={(e) => setInsuranceCarrier(e.target.value)} />
               </div>
               <CarrierTierBadge carrier={insuranceCarrier} showHint />
+              {insuranceCarrier.trim() && (
+                <CarrierIntelBadge carrier={insuranceCarrier} />
+              )}
+
+              <div className="border-t border-zinc-800 pt-3">
+                <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-wider text-zinc-500">
+                  Named Insured / Policyholder Match
+                </span>
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setPolicyholderMatch(true)}
+                    aria-pressed={policyholderMatch}
+                    className={clsx(
+                      'rounded-md border px-2 py-1.5 text-xs font-semibold',
+                      policyholderMatch
+                        ? 'border-emerald-500/60 bg-emerald-500/15 text-emerald-200'
+                        : 'border-zinc-700 text-zinc-500 hover:text-zinc-300',
+                    )}
+                  >
+                    Yes — matches policy
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPolicyholderMatch(false)}
+                    aria-pressed={!policyholderMatch}
+                    className={clsx(
+                      'rounded-md border px-2 py-1.5 text-xs font-semibold',
+                      !policyholderMatch
+                        ? 'border-amber-500/60 bg-amber-500/15 text-amber-200'
+                        : 'border-zinc-700 text-zinc-500 hover:text-zinc-300',
+                    )}
+                  >
+                    No — off-site proxy
+                  </button>
+                </div>
+
+                {!policyholderMatch && (
+                  <div className="mt-2 space-y-2 rounded-md border border-amber-500/30 bg-amber-500/5 p-2">
+                    <p className="text-[11px] text-amber-200">
+                      A Remote AOB Secure Signing Link will be dispatched to the proxy below instead
+                      of collecting an on-site signature.
+                    </p>
+                    <input
+                      className={input}
+                      placeholder="Proxy full name *"
+                      value={proxyFullName}
+                      onChange={(e) => setProxyFullName(e.target.value)}
+                    />
+                    <input
+                      className={input}
+                      placeholder="Relationship to policyholder"
+                      value={proxyRelationship}
+                      onChange={(e) => setProxyRelationship(e.target.value)}
+                    />
+                    <div className="grid grid-cols-2 gap-2">
+                      <input
+                        className={input}
+                        placeholder="Proxy phone"
+                        value={proxyPhone}
+                        onChange={(e) => setProxyPhone(e.target.value)}
+                      />
+                      <input
+                        className={input}
+                        placeholder="Proxy email"
+                        value={proxyEmail}
+                        onChange={(e) => setProxyEmail(e.target.value)}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
               <label className="block border-t border-zinc-800 pt-3">
                 <span className="mb-1 block font-mono text-[11px] uppercase tracking-wider text-zinc-500">
                   Intake owner / rep
@@ -501,6 +623,10 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
 
           {step === 2 && (
             <>
+              <p className="text-[11px] text-zinc-500">
+                Document Vault — Driver&apos;s License, Insurance Card, and Prior Estimate are
+                optional here; capture them now or follow up later.
+              </p>
               {DOC_SLOTS.map((slot) => (
                 <label key={slot.kind} className="block">
                   <span className="mb-1 block font-mono text-[11px] uppercase tracking-wider text-zinc-500">
@@ -520,9 +646,13 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                   {slot.kind === 'INSURANCE_CARD' && scanMsg && (
                     <span className="mt-0.5 block text-[11px] text-sky-300">{scanMsg}</span>
                   )}
-                  {docs[slot.kind] && (
+                  {docs[slot.kind] ? (
                     <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
                       ✓ {docs[slot.kind]?.fileName}
+                    </span>
+                  ) : (
+                    <span className="mt-0.5 inline-flex rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300">
+                      {slot.label}: Pending
                     </span>
                   )}
                 </label>
@@ -543,6 +673,11 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                   onChange={(e) => void onEstimateFile(e.target.files?.[0])}
                   className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
                 />
+                {!docs.PRIOR_ESTIMATE && (
+                  <span className="mt-0.5 inline-flex rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300">
+                    Initial Estimate: Pending
+                  </span>
+                )}
                 {parseMsg && <span className="mt-1 block text-[11px] text-sky-300">{parseMsg}</span>}
                 {parsedItems.length > 0 && (
                   <ul className="mt-1.5 max-h-28 space-y-0.5 overflow-y-auto rounded-md border border-zinc-800 bg-zinc-950/60 p-2 text-[11px] text-zinc-400">
@@ -555,6 +690,37 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                   </ul>
                 )}
               </label>
+
+              {carrierChecklist.length > 0 && (
+                <div className="space-y-2 border-t border-amber-500/20 bg-amber-500/5 p-2 pt-3">
+                  <p className="font-mono text-[11px] uppercase tracking-wider text-amber-300">
+                    Carrier-Required Documentation
+                  </p>
+                  <p className="text-[11px] text-zinc-500">
+                    {insuranceCarrier || 'This carrier'} flags claims for scrutiny — capture these
+                    before proceeding.
+                  </p>
+                  {carrierChecklist.map((kind) => (
+                    <label key={kind} className="block">
+                      <span className="mb-1 block font-mono text-[11px] uppercase tracking-wider text-zinc-500">
+                        {CHECKLIST_ITEM_LABEL[kind]} <span className="text-red-400">*</span>
+                      </span>
+                      <input
+                        type="file"
+                        accept="image/*"
+                        capture="environment"
+                        onChange={(e) => setDoc(kind, e.target.files?.[0])}
+                        className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
+                      />
+                      {docs[kind] && (
+                        <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
+                          ✓ {docs[kind]?.fileName}
+                        </span>
+                      )}
+                    </label>
+                  ))}
+                </div>
+              )}
             </>
           )}
 
@@ -756,70 +922,66 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
             </>
           )}
 
-          {step === 5 && (
+          {step === 5 && !policyholderMatch && (
             <>
-              <div className="max-h-56 space-y-2 overflow-y-auto rounded-md border border-zinc-800 bg-zinc-950/60 p-3 text-[11px] leading-relaxed text-zinc-400">
-                <p className="font-semibold text-zinc-200">
-                  Specialized PDR &amp; Auto Hail Repair Service Agreement
-                </p>
+              <div className="space-y-2 rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-100">
+                <p className="font-semibold text-amber-200">Remote AOB Execution Gate</p>
                 <p>
-                  <span className="font-semibold text-zinc-300">(a) Repair Authorization &amp; Assignment of Benefits (AOB).</span>{' '}
-                  I authorize the shop to perform repairs and assign my insurance benefits to the
-                  shop for direct payout of the covered loss, including any approved supplements.
+                  {proxyFullName || 'The proxy'} isn&apos;t the Named Insured, so no on-site signature
+                  is collected here. Submitting this intake will email
+                  {proxyEmail ? ` ${proxyEmail}` : ' the proxy'} a Remote AOB Secure Signing Link to
+                  review and sign the same agreement off-site.
                 </p>
-                <p>
-                  <span className="font-semibold text-zinc-300">(b) PDR Paint Integrity Waiver.</span>{' '}
-                  I acknowledge that severe or stretched hail dents on weathered, aged, or
-                  previously repainted panels carry an inherent risk of paint micro-fracturing or
-                  chipping during metal manipulation. I release the shop from liability for
-                  pre-existing factory paint flaws or finish failure attributable to panel age or
-                  prior refinish.
-                </p>
-                <p>
-                  <span className="font-semibold text-zinc-300">(c) R&amp;I (Removal &amp; Installation) Liability.</span>{' '}
-                  I authorize dropping headliners and removing interior trim, lamps, and glass as
-                  needed, and waive liability for aged or brittle plastic clips, fasteners, or
-                  electronic sensors that may fail during a hail teardown.
-                </p>
-                <p>
-                  <span className="font-semibold text-zinc-300">(d) Hail Supplement &amp; Blueprinting Disclosure.</span>{' '}
-                  I understand initial carrier drive-by or photo estimates commonly miss hidden
-                  hail damage (underside bracing, unpainted aluminum panels, edge damage), and I
-                  authorize a light-board scope and the submission of direct carrier supplements.
-                </p>
-                <p>
-                  <span className="font-semibold text-zinc-300">(e) Storage, Security &amp; Mechanic&apos;s Lien.</span>{' '}
-                  Vehicles left after completion or authorization withdrawal may accrue daily
-                  storage fees, and the shop may exercise a mechanic&apos;s lien for unpaid
-                  authorized charges as permitted by law.
+                <p className="text-amber-300/80">
+                  The lead stays at NEW until the proxy signs remotely, which then locks it to AOB
+                  Signed automatically.
                 </p>
               </div>
 
               {provideLoaner && (
-                <div className="max-h-44 space-y-2 overflow-y-auto rounded-md border border-sky-500/30 bg-sky-500/5 p-3 text-[11px] leading-relaxed text-zinc-400">
-                  <p className="font-semibold text-sky-200">Rental / Loaner Vehicle Agreement</p>
-                  <p>
-                    <span className="font-semibold text-zinc-300">Liability.</span> The customer is
-                    responsible for the loaner while in their possession, including damage,
-                    citations, and tolls.
+                <>
+                  <RentalAgreementText operator={rentalOperator} />
+                  <p className="text-[11px] text-amber-200">
+                    {rentalOperator.name || 'The on-site proxy'} is taking custody of the loaner
+                    today, so the Rental Fleet Agreement above is signed on-site now — separate
+                    from the main repair AOB, which the policyholder signs remotely.
                   </p>
-                  <p>
-                    <span className="font-semibold text-zinc-300">Insurance verification.</span>{' '}
-                    Customer affirms valid personal auto insurance extends to the loaner; the shop
-                    may verify coverage before release.
-                  </p>
-                  <p>
-                    <span className="font-semibold text-zinc-300">Fuel &amp; mileage policy.</span>{' '}
-                    The loaner is returned at the recorded fuel level; excess mileage and
-                    unreturned fuel may incur charges.
-                  </p>
-                  <p>
-                    <span className="font-semibold text-zinc-300">Authorized return.</span> The
-                    loaner must be returned by the authorized return date or upon repair
-                    completion, whichever comes first.
-                  </p>
-                </div>
+                  <label className="flex items-start gap-2 text-xs text-zinc-300">
+                    <input
+                      type="checkbox"
+                      checked={agreed}
+                      onChange={(e) => setAgreed(e.target.checked)}
+                      className="mt-0.5"
+                    />
+                    I have read and accept the Rental / Loaner Agreement on behalf of{' '}
+                    {rentalOperator.name || 'the on-site driver'}, and authorize release of the
+                    vehicle.
+                  </label>
+                  <div>
+                    <p className="mb-1 font-mono text-[11px] uppercase tracking-wider text-zinc-500">
+                      {rentalOperator.name || 'Driver'} signature (Rental Agreement)
+                    </p>
+                    <SignaturePad onChange={setSignatureDataUrl} />
+                  </div>
+                </>
               )}
+            </>
+          )}
+
+          {step === 5 && policyholderMatch && (
+            <>
+              <AobAgreementText
+                customerName={customerName}
+                vehicleYear={vehicleYear}
+                vehicleMake={vehicleMake}
+                vehicleModel={vehicleModel}
+                vinLast8={vinLast8}
+                claimNumber={claimNumber}
+                insuranceCarrier={insuranceCarrier}
+                policyNumber={policyNumber}
+              />
+
+              {provideLoaner && <RentalAgreementText operator={rentalOperator} />}
 
               <label className="flex items-start gap-2 text-xs text-zinc-300">
                 <input type="checkbox" checked={agreed} onChange={(e) => setAgreed(e.target.checked)} className="mt-0.5" />
@@ -858,12 +1020,30 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                       : 'None'
                   }
                 />
-                <Row label="Signature" value={signatureDataUrl ? '✓ Captured' : '✗ Missing'} />
-                <Row label="Agreement" value={agreed ? '✓ Accepted' : '✗ Not accepted'} />
+                <Row
+                  label="Policyholder"
+                  value={policyholderMatch ? 'Named Insured on-site' : `Proxy — ${proxyFullName || 'unnamed'}`}
+                />
+                {carrierChecklist.length > 0 && (
+                  <Row
+                    label="Carrier checklist"
+                    value={`${carrierChecklist.filter((k) => docs[k]).length}/${carrierChecklist.length} captured`}
+                  />
+                )}
+                {!policyholderMatch && <Row label="Remote AOB" value="Will dispatch on submit" />}
+                {requiresOnSiteSignature && (
+                  <>
+                    <Row
+                      label={policyholderMatch ? 'Signature' : 'Rental agreement signature'}
+                      value={signatureDataUrl ? '✓ Captured' : '✗ Missing'}
+                    />
+                    <Row label="Agreement" value={agreed ? '✓ Accepted' : '✗ Not accepted'} />
+                  </>
+                )}
               </dl>
-              {(!signatureDataUrl || !agreed) && (
+              {requiresOnSiteSignature && (!signatureDataUrl || !agreed) && (
                 <p className="text-[11px] text-amber-300">
-                  Signature and agreement acceptance are required (Step 4) before submitting.
+                  Signature and agreement acceptance are required (Step 5) before submitting.
                 </p>
               )}
             </div>
@@ -892,7 +1072,7 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
             <button
               type="button"
               onClick={() => void submit()}
-              disabled={submitting || !signatureDataUrl || !agreed}
+              disabled={submitting || (requiresOnSiteSignature && (!signatureDataUrl || !agreed))}
               className="rounded-md bg-emerald-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
             >
               {submitting ? 'Submitting…' : 'Submit Intake'}
@@ -904,11 +1084,75 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
   );
 }
 
+/** Rental Fleet Agreement text, bound to whichever driver resolveRentalOperator
+ *  picked — the on-site proxy when the Named Insured isn't present, else the
+ *  customer. Rendered whether or not the main repair AOB is signed on-site. */
+function RentalAgreementText({ operator }: { operator: RentalOperatorBinding }) {
+  return (
+    <div className="max-h-44 space-y-2 overflow-y-auto rounded-md border border-sky-500/30 bg-sky-500/5 p-3 text-[11px] leading-relaxed text-zinc-400">
+      <p className="font-semibold text-sky-200">Rental / Loaner Vehicle Agreement</p>
+      <p>
+        <span className="font-semibold text-zinc-300">Bound driver.</span>{' '}
+        {operator.source === 'PROXY'
+          ? `This loaner is issued to ${operator.name || 'the on-site proxy'}${
+              operator.relationship ? ` (${operator.relationship} of the policyholder)` : ''
+            }, the on-site driver, rather than the absent Named Insured.`
+          : `This loaner is issued to ${operator.name || 'the customer'}, the Named Insured.`}{' '}
+        Driver&apos;s license on file:{' '}
+        {operator.licenseOnFile ? 'Yes' : 'Pending — capture before releasing the vehicle.'}
+      </p>
+      <p>
+        <span className="font-semibold text-zinc-300">Liability.</span>{' '}
+        {operator.name || 'The bound driver'} is responsible for the loaner while in their
+        possession, including damage, citations, and tolls.
+      </p>
+      <p>
+        <span className="font-semibold text-zinc-300">Insurance verification.</span>{' '}
+        {operator.name || 'The bound driver'} affirms valid personal auto insurance extends to
+        the loaner; the shop may verify coverage before release.
+      </p>
+      <p>
+        <span className="font-semibold text-zinc-300">Fuel &amp; mileage policy.</span> The
+        loaner is returned at the recorded fuel level; excess mileage and unreturned fuel may
+        incur charges.
+      </p>
+      <p>
+        <span className="font-semibold text-zinc-300">Authorized return.</span> The loaner must
+        be returned by the authorized return date or upon repair completion, whichever comes
+        first.
+      </p>
+    </div>
+  );
+}
+
 function Row({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex justify-between gap-2">
       <dt className="text-zinc-500">{label}</dt>
       <dd className="text-right text-zinc-200">{value}</dd>
+    </div>
+  );
+}
+
+const RISK_TONE: Record<'LOW' | 'MODERATE' | 'HIGH', string> = {
+  LOW: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200',
+  MODERATE: 'border-amber-500/40 bg-amber-500/10 text-amber-200',
+  HIGH: 'border-red-500/40 bg-red-500/10 text-red-200',
+};
+
+/** Carrier lowball/supplement risk badge (distinct from CarrierTierBadge's
+ *  FNOL-automation tier) — see src/lib/carrier-intel.ts. */
+function CarrierIntelBadge({ carrier }: { carrier: string }) {
+  const intel = getCarrierIntel(carrier);
+  return (
+    <div
+      className={clsx(
+        'rounded-md border px-2 py-1 text-[11px] font-medium',
+        RISK_TONE[intel.riskProfile],
+      )}
+    >
+      {intel.lowballFlag ? '⚠ Lowball risk' : 'Standard risk'} · {intel.riskProfile}
+      {intel.supplementFlag && ' · Expect supplement'}
     </div>
   );
 }

@@ -7,7 +7,7 @@
  * technician matrix, and a required digital engagement agreement. Client-side
  * validation with success/error banners; persists via /api/v1/shop/config.
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { clsx } from 'clsx';
 import {
   STAFF_ROLES,
@@ -15,6 +15,7 @@ import {
   type ShopConfig,
   type StaffMember,
 } from './types';
+import { getRegionalPdrBaseline, parsePdrMatrixFile } from '@/lib/pdr-matrix-parser';
 
 function genId(prefix: string): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -54,9 +55,13 @@ export function ShopIntakeForm() {
   const [staff, setStaff] = useState<StaffMember[]>([blankStaff()]);
   const [pdrMatrix, setPdrMatrix] = useState<PdrMatrixRow[]>([blankMatrix()]);
   const [engagementAccepted, setEngagementAccepted] = useState(false);
+  const [hasFleet, setHasFleet] = useState(true);
 
   const [submitting, setSubmitting] = useState(false);
   const [status, setStatus] = useState<{ type: 'success' | 'error'; msg: string } | null>(null);
+  const [matrixMsg, setMatrixMsg] = useState<string | null>(null);
+  const [dragActive, setDragActive] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Prefill from any previously-saved config.
   useEffect(() => {
@@ -79,6 +84,7 @@ export function ShopIntakeForm() {
         if (c.staff?.length) setStaff(c.staff);
         if (c.pdrMatrix?.length) setPdrMatrix(c.pdrMatrix);
         setEngagementAccepted(Boolean(c.engagementAccepted));
+        setHasFleet(c.hasFleet !== false);
       } catch {
         /* no existing config */
       }
@@ -92,6 +98,22 @@ export function ShopIntakeForm() {
     setStaff((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
   const patchMatrix = (id: string, patch: Partial<PdrMatrixRow>) =>
     setPdrMatrix((prev) => prev.map((m) => (m.id === id ? { ...m, ...patch } : m)));
+
+  const importMatrixFile = async (file: File | undefined) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const rows = parsePdrMatrixFile(text);
+      if (rows.length === 0) {
+        setMatrixMsg('Could not parse any technician rows from that file — check the format.');
+        return;
+      }
+      setPdrMatrix(rows);
+      setMatrixMsg(`Imported ${rows.length} technician rate row${rows.length === 1 ? '' : 's'} from ${file.name}.`);
+    } catch {
+      setMatrixMsg('Could not read that file.');
+    }
+  };
 
   const validate = (): string[] => {
     const errs: string[] = [];
@@ -113,6 +135,21 @@ export function ShopIntakeForm() {
     setSubmitting(true);
     setStatus(null);
     try {
+      // No manually-entered or uploaded matrix rows — fall back to the
+      // regional default baseline (keyed off the shop's state) so the shop
+      // always has a PDR rate on file rather than submitting with none.
+      const enteredMatrix = pdrMatrix.filter((m) => m.technician.trim());
+      const finalMatrix =
+        enteredMatrix.length > 0
+          ? enteredMatrix
+          : [
+              {
+                id: genId('pdr'),
+                technician: 'Shop Default (Regional Baseline)',
+                ...getRegionalPdrBaseline(stateCode),
+              },
+            ];
+
       const payload: ShopConfig = {
         shopName: shopName.trim(),
         addressLine: addressLine.trim(),
@@ -127,7 +164,8 @@ export function ShopIntakeForm() {
         },
         engagementAccepted,
         staff: staff.filter((s) => s.name.trim()),
-        pdrMatrix: pdrMatrix.filter((m) => m.technician.trim()),
+        pdrMatrix: finalMatrix,
+        hasFleet,
       };
       const res = await fetch('/api/v1/shop/config', {
         method: 'POST',
@@ -230,6 +268,23 @@ export function ShopIntakeForm() {
         </div>
       </section>
 
+      {/* Fleet / rental */}
+      <section className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-4">
+        <h2 className={sectionTitle}>Fleet / Rental</h2>
+        <p className="mt-1 text-xs text-zinc-400">
+          Turn this off for a partner or independent shop that doesn&apos;t maintain its own
+          loaner/rental fleet — the Shop Drop-off routing action will skip vehicle allocation.
+        </p>
+        <label className="mt-2 flex items-center gap-2 text-sm text-zinc-200">
+          <input
+            type="checkbox"
+            checked={hasFleet}
+            onChange={(e) => setHasFleet(e.target.checked)}
+          />
+          This shop maintains a loaner / rental fleet.
+        </label>
+      </section>
+
       {/* Staff roster */}
       <section className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-4">
         <div className="flex items-center justify-between">
@@ -281,6 +336,43 @@ export function ShopIntakeForm() {
           </button>
         </div>
         <p className="mt-1 text-[11px] text-zinc-500">Per-technician matrix rate ($) by dent coin size.</p>
+
+        {/* CSV/JSON matrix import dropzone */}
+        <div
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragActive(true);
+          }}
+          onDragLeave={() => setDragActive(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragActive(false);
+            void importMatrixFile(e.dataTransfer.files?.[0]);
+          }}
+          onClick={() => fileInputRef.current?.click()}
+          role="button"
+          tabIndex={0}
+          className={clsx(
+            'mt-3 cursor-pointer rounded-md border border-dashed px-3 py-3 text-center text-xs transition-colors',
+            dragActive
+              ? 'border-sky-500/60 bg-sky-500/10 text-sky-200'
+              : 'border-zinc-700 text-zinc-500 hover:border-zinc-600 hover:text-zinc-400',
+          )}
+        >
+          Drop a CSV or JSON matrix file here, or click to browse.
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".csv,.json,text/csv,application/json"
+            className="hidden"
+            onChange={(e) => void importMatrixFile(e.target.files?.[0])}
+          />
+        </div>
+        {matrixMsg && <p className="mt-1 text-[11px] text-sky-300">{matrixMsg}</p>}
+        <p className="mt-1 text-[10px] text-zinc-600">
+          No file uploaded? A regional default baseline (based on shop state) is used automatically.
+        </p>
+
         <div className="mt-3 space-y-2">
           <div className="hidden grid-cols-[1.6fr_repeat(4,1fr)_auto] gap-2 px-1 text-[10px] uppercase tracking-wider text-zinc-500 sm:grid">
             <span>Technician</span>

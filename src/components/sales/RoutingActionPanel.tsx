@@ -9,7 +9,7 @@
 import { useEffect, useState } from 'react';
 import { clsx } from 'clsx';
 import { updateLeadRouting, updateDispatchStatus } from '@/lib/sales-db';
-import { getAvailableVehicles, assignVehicle } from '@/lib/rental-db';
+import { getAvailableVehicles, reserveVehicle } from '@/lib/rental-db';
 import {
   DISPATCH_STATUS_LABEL,
   DISPATCH_STATUS_ORDER,
@@ -76,12 +76,10 @@ export function RoutingActionPanel({ lead, onUpdated }: RoutingActionPanelProps)
     setBusy(true);
     setError(null);
     try {
-      await assignVehicle(vehicleId, {
-        leadId: lead.id,
-        customerName: lead.customerName,
-        startingMileage: 0,
-        fuelLevel: 100,
-      });
+      // Hold, don't check out — mileage/fuel aren't known yet here (the
+      // customer hasn't picked the vehicle up); Fleet Command Center
+      // confirms pickup into RENTED once the real numbers are captured.
+      await reserveVehicle(vehicleId, lead.id, lead.customerName);
       await updateLeadRouting(lead.id, 'SHOP_DROPOFF');
       onUpdated();
     } catch (err) {

@@ -22,6 +22,7 @@ import type { RentalStatus, RentalVehicle } from '@/components/sales/types';
 
 const STATUS_TONE: Record<RentalStatus, string> = {
   AVAILABLE: 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200',
+  RESERVED: 'border-violet-500/40 bg-violet-500/15 text-violet-200',
   RENTED: 'border-sky-500/40 bg-sky-500/15 text-sky-200',
   MAINTENANCE: 'border-amber-500/40 bg-amber-500/15 text-amber-200',
 };
@@ -85,6 +86,7 @@ export default function FleetPage() {
     () => ({
       total: fleet.length,
       available: fleet.filter((v) => v.currentStatus === 'AVAILABLE').length,
+      reserved: fleet.filter((v) => v.currentStatus === 'RESERVED').length,
       rented: fleet.filter((v) => v.currentStatus === 'RENTED').length,
       maintenance: fleet.filter((v) => v.currentStatus === 'MAINTENANCE').length,
     }),
@@ -93,8 +95,10 @@ export default function FleetPage() {
 
   const startAssign = (v: RentalVehicle) => {
     setAssigningId(v.id);
-    setAssignCustomer('');
-    setAssignAgent('');
+    // A RESERVED unit already has a customer/agent from the routing-panel
+    // hold — prefill so confirming pickup doesn't require retyping them.
+    setAssignCustomer(v.assignedCustomer ?? '');
+    setAssignAgent(v.assignedAgent ?? '');
     setAssignMileage(String(v.currentMileage));
   };
 
@@ -193,9 +197,10 @@ export default function FleetPage() {
         )}
 
         {/* Metrics */}
-        <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-5">
           <Metric label="Total Fleet" value={metrics.total} />
           <Metric label="Available" value={metrics.available} tone="text-emerald-300" />
+          <Metric label="Reserved" value={metrics.reserved} tone="text-violet-300" />
           <Metric label="Rented Out" value={metrics.rented} tone="text-sky-300" />
           <Metric label="In Maintenance" value={metrics.maintenance} tone="text-amber-300" />
         </div>
@@ -373,6 +378,24 @@ function FleetRow({
                 Assign
               </button>
             )}
+            {v.currentStatus === 'RESERVED' && !assigning && (
+              <>
+                <button
+                  type="button"
+                  onClick={onStartAssign}
+                  className={clsx(btn, 'border-sky-500/40 bg-sky-500/10 text-sky-300 hover:bg-sky-500/20')}
+                >
+                  Confirm Pickup
+                </button>
+                <button
+                  type="button"
+                  onClick={onReturn}
+                  className={clsx(btn, 'border-violet-500/40 bg-violet-500/10 text-violet-300 hover:bg-violet-500/20')}
+                >
+                  Release
+                </button>
+              </>
+            )}
             {v.currentStatus === 'MAINTENANCE' ? (
               <button
                 type="button"
@@ -381,7 +404,7 @@ function FleetRow({
               >
                 Mark Available
               </button>
-            ) : (
+            ) : v.currentStatus !== 'RESERVED' ? (
               <button
                 type="button"
                 onClick={onMaintenance}
@@ -389,8 +412,8 @@ function FleetRow({
               >
                 Mark Maintenance
               </button>
-            )}
-            {v.currentStatus !== 'RENTED' && (
+            ) : null}
+            {v.currentStatus !== 'RENTED' && v.currentStatus !== 'RESERVED' && (
               <button
                 type="button"
                 onClick={onRemove}
@@ -406,7 +429,9 @@ function FleetRow({
         <tr className="border-b border-zinc-800/60 bg-zinc-950/40">
           <td colSpan={7} className="px-3 py-2">
             <div className="flex flex-wrap items-center gap-2">
-              <span className="text-[11px] text-zinc-500">Assign {v.id} to:</span>
+              <span className="text-[11px] text-zinc-500">
+                {v.currentStatus === 'RESERVED' ? `Confirm pickup for ${v.id}:` : `Assign ${v.id} to:`}
+              </span>
               <input
                 value={assignCustomer}
                 onChange={(e) => onAssignCustomer(e.target.value)}

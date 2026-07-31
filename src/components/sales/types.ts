@@ -163,7 +163,7 @@ export const LEAD_STATUS_LABEL: Record<LeadStatus, string> = {
 // Rental / loaner fleet
 // ---------------------------------------------------------------------------
 
-export type RentalStatus = 'AVAILABLE' | 'RENTED' | 'MAINTENANCE';
+export type RentalStatus = 'AVAILABLE' | 'RESERVED' | 'RENTED' | 'MAINTENANCE';
 
 export interface RentalVehicle {
   id: string;

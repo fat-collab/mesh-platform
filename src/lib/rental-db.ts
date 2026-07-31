@@ -9,6 +9,7 @@
 import { getSupabaseBrowserClient } from './supabase';
 import { executeDBOperation } from './db-guard';
 import { MOCK_FLEET } from './rental-mock';
+import { reserveVehicleForLead } from '@/app/actions/fleet-reservation';
 import type { RentalStatus, RentalVehicle } from '@/components/sales/types';
 
 const FLEET_TABLE = 'rental_vehicles';
@@ -131,6 +132,30 @@ export async function assignVehicle(vehicleId: string, input: AssignVehicleInput
     /* fall through to local */
   }
   patchLocal(vehicleId, patch);
+}
+
+/**
+ * Holds a vehicle for a lead without fabricating checkout data — the
+ * two-phase counterpart to assignVehicle(). Routing-panel booking only knows
+ * "reserve this unit for this lead," not real mileage/fuel (those are only
+ * known at physical handoff, confirmed later via assignVehicle() from the
+ * Fleet Command Center). Routed through a Server Action for consistency with
+ * the rest of the sales-pipeline write path (see fleet-reservation.ts).
+ */
+export async function reserveVehicle(
+  vehicleId: string,
+  leadOrRoId: string,
+  customerName: string,
+): Promise<void> {
+  const result = await reserveVehicleForLead({ vehicleId, leadOrRoId, customerName });
+  if (!result.success) {
+    console.warn(`[rental-db] reservation failed for vehicle ${vehicleId}:`, result.error);
+    patchLocal(vehicleId, {
+      currentStatus: 'RESERVED',
+      assignedLeadId: leadOrRoId,
+      assignedCustomer: customerName,
+    });
+  }
 }
 
 export interface AddVehicleInput {

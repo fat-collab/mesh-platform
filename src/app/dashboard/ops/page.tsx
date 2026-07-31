@@ -26,6 +26,7 @@ import { UnlockGateModal } from '@/components/ops/UnlockGateModal';
 import { RODetailDrawer } from '@/components/ops/RODetailDrawer';
 import { BoardToolbar, type BoardFilter } from '@/components/ops/BoardToolbar';
 import { AuditHistoryView } from '@/components/ops/AuditHistoryView';
+import { FieldDispatchQueue } from '@/components/ops/FieldDispatchQueue';
 
 /** Raw repair_orders row as delivered by Supabase Realtime (no joins). */
 type RepairOrderRow = Database['public']['Tables']['repair_orders']['Row'];
@@ -47,7 +48,24 @@ export default function OpsCockpitPage() {
   const [unlockBusy, setUnlockBusy] = useState(false);
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<BoardFilter>('all');
-  const [view, setView] = useState<'board' | 'audit'>('board');
+  const [view, setView] = useState<'board' | 'audit' | 'dispatch'>('board');
+  // Field Dispatch Queue tab — Ops/Shop Manager only (MANAGER/EXECUTIVE).
+  const [canDispatch, setCanDispatch] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const profile = await getCurrentProfile(getSupabaseBrowserClient());
+        if (!cancelled) setCanDispatch(profile?.role === 'MANAGER' || profile?.role === 'EXECUTIVE');
+      } catch {
+        /* no session — stays hidden */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Shop's configured staff roster — fetched once, powers each card's
   // quick-assign dropdown so assignment picks a real staff member, not free text.
@@ -483,6 +501,7 @@ export default function OpsCockpitPage() {
             [
               { id: 'board', label: 'Live Kanban Board' },
               { id: 'audit', label: 'Audit History & Gate Logs' },
+              ...(canDispatch ? [{ id: 'dispatch', label: 'Field Dispatch Queue' }] as const : []),
             ] as const
           ).map((tab) => (
             <button
@@ -517,6 +536,8 @@ export default function OpsCockpitPage() {
 
         {view === 'audit' ? (
           <AuditHistoryView />
+        ) : view === 'dispatch' ? (
+          <FieldDispatchQueue />
         ) : loadState === 'loading' ? (
           <div className="flex h-64 items-center justify-center text-sm text-zinc-500">
             Loading board…

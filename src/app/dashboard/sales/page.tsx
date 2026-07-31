@@ -39,7 +39,6 @@ import { DigitalIntakeQuickAdd } from '@/components/sales/DigitalIntakeQuickAdd'
 import { LeadActionCard } from '@/components/sales/LeadActionCard';
 import { LeadOwnerChip } from '@/components/sales/LeadOwnerChip';
 import { RoutingActionPanel } from '@/components/sales/RoutingActionPanel';
-import { DispatchButton } from '@/components/sales/DispatchButton';
 import { CommissionPanel } from '@/components/sales/CommissionPanel';
 
 /** The 4 streamlined pipeline gates shown on each tab's board. */
@@ -254,12 +253,7 @@ function LeadCard({
         </select>
       </div>
 
-      {showRouting && (
-        <>
-          <RoutingActionPanel lead={lead} onUpdated={onRefetch} />
-          <DispatchButton lead={lead} onUpdated={onRefetch} />
-        </>
-      )}
+      {showRouting && <RoutingActionPanel lead={lead} onUpdated={onRefetch} />}
 
       {(lead.status === 'APPROVED' ||
         lead.status === 'AOB_SIGNED' ||

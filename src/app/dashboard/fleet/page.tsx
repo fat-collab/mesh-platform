@@ -104,6 +104,10 @@ export default function FleetPage() {
 
   const confirmAssign = async (v: RentalVehicle) => {
     await assignVehicle(v.id, {
+      // Carry the RESERVED unit's lead/RO binding through to RENTED — a
+      // fresh walk-in Assign from AVAILABLE has no assignedLeadId, so this
+      // is a no-op (null) in that case.
+      leadId: v.assignedLeadId,
       customerName: assignCustomer.trim() || 'Walk-in',
       agentName: assignAgent.trim() || null,
       startingMileage: parseInt(assignMileage, 10) || v.currentMileage,

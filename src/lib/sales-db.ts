@@ -12,6 +12,7 @@ import { getCurrentProfile } from './auth';
 import { MOCK_LEADS } from './sales-mock';
 import { MOCK_BOARD_ORDERS } from './ops-mock';
 import { bridgeRepairOrder } from '@/app/actions/intake-bridge';
+import { dispatchMobileUnit, advanceDispatchStatus } from '@/app/actions/dispatch';
 import type {
   DispatchStatus,
   IntakeDocumentRef,
@@ -515,10 +516,11 @@ export async function assignLeadStaff(
 }
 
 /**
- * Records the post-contact dual-path routing decision on a lead card:
- * Book Shop Drop-off + Fleet Reservation, or Dispatch Mobile House Call. For
- * the mobile path this also seeds the field-agent assignment and starts the
- * dispatch lifecycle at DISPATCHED.
+ * Records the post-contact routing decision on a lead card: Book Shop
+ * Drop-off + Fleet Reservation. (Dispatch Mobile House Call moved to Ops —
+ * see dispatchLead() below, backed by the dispatch.ts Server Action — so
+ * this is only ever called with 'SHOP_DROPOFF' now; the MOBILE_HOUSE_CALL
+ * branch stays correct if that ever changes, just currently unreachable.)
  */
 export async function updateLeadRouting(
   id: string,
@@ -555,24 +557,36 @@ export async function updateLeadRouting(
   }
 }
 
+/**
+ * Routes a lead to a mobile house call and starts its dispatch lifecycle —
+ * the Ops-side counterpart to updateLeadRouting's shop-drop-off path. Routed
+ * through the dispatch.ts Server Action (Ops Workflow Realignment: field
+ * deployment is now an Ops/Shop Manager decision, not a Sales-rep one).
+ */
+export async function dispatchLead(id: string, agentName: string): Promise<void> {
+  const staffName = agentName.trim();
+  const result = await dispatchMobileUnit({ leadId: id, agentName: staffName });
+  if (!result.success) {
+    console.warn(`[sales-db] dispatch failed for lead ${id}:`, result.error);
+    ensureSeed();
+    const lead = localLeads.find((l) => l.id === id);
+    if (lead) {
+      lead.routingPath = 'MOBILE_HOUSE_CALL';
+      lead.dispatchStaffName = staffName;
+      lead.dispatchStatus = 'DISPATCHED';
+    }
+  }
+}
+
 /** Advances a mobile house-call lead's field dispatch lifecycle. */
 export async function updateDispatchStatus(id: string, status: DispatchStatus): Promise<void> {
-  try {
-    const supabase = getSupabaseBrowserClient();
-    const { data, error } = await supabase
-      .from(LEADS_TABLE)
-      .update({ dispatch_status: status })
-      .eq('id', id)
-      .select('id');
-    if (!error && data && data.length > 0) {
-      /* also fall through — keep the local mirror in sync below */
-    }
-  } catch {
-    /* fall through to local */
+  const result = await advanceDispatchStatus({ leadId: id, status });
+  if (!result.success) {
+    console.warn(`[sales-db] dispatch status update failed for lead ${id}:`, result.error);
+    ensureSeed();
+    const lead = localLeads.find((l) => l.id === id);
+    if (lead) lead.dispatchStatus = status;
   }
-  ensureSeed();
-  const lead = localLeads.find((l) => l.id === id);
-  if (lead) lead.dispatchStatus = status;
 }
 
 /**

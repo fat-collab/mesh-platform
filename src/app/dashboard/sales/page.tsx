@@ -182,8 +182,23 @@ function LeadCard({
         {lead.phone} · {new Date(lead.intakeDate).toLocaleDateString()}
       </p>
 
-      {(lead.stormTag || lead.zipCode || lead.severity || (lead.damagePhotos?.length ?? 0) > 0) && (
+      {(lead.stormTag ||
+        lead.zipCode ||
+        lead.severity ||
+        (lead.damagePhotos?.length ?? 0) > 0 ||
+        (lead.additionalVehicles?.length ?? 0) > 0) && (
         <div className="mt-1.5 flex flex-wrap gap-1">
+          {(lead.additionalVehicles?.length ?? 0) > 0 && (
+            <span
+              className="rounded border border-violet-500/40 bg-violet-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-violet-300"
+              title={lead.additionalVehicles
+                ?.map((v) => `${v.vehicleYear ?? ''} ${v.vehicleMake ?? ''} ${v.vehicleModel ?? ''}`.trim())
+                .join(', ')}
+            >
+              🚗 +{lead.additionalVehicles?.length} more vehicle
+              {(lead.additionalVehicles?.length ?? 0) > 1 ? 's' : ''}
+            </span>
+          )}
           {lead.stormTag && (
             <span className="rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300">
               ⛈ {lead.stormTag}

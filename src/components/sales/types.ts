@@ -67,6 +67,24 @@ export interface IntakeLead {
   address?: string;
   /** Initial damage triage from Quick Porch Capture, refined later. */
   damageType?: DamageType;
+  /** Vehicles beyond the primary one above — a storm can hit more than one
+   *  vehicle at the same property. Empty/absent for the common single-vehicle
+   *  case. Lazily populated; not every lead list fetch attaches this. */
+  additionalVehicles?: LeadVehicle[];
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Vehicle Household Leads
+// ---------------------------------------------------------------------------
+
+/** A vehicle beyond a lead's primary one (see IntakeLead.additionalVehicles). */
+export interface LeadVehicle {
+  id: string;
+  vehicleYear?: number;
+  vehicleMake?: string;
+  vehicleModel?: string;
+  vin?: string;
+  severity?: StormSeverity;
 }
 
 // ---------------------------------------------------------------------------

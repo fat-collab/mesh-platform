@@ -21,6 +21,7 @@ import type {
   IntakeSubmission,
   LeadChannel,
   LeadStatus,
+  LeadVehicle,
   ProxyPolicyholder,
   RemoteAobStatus,
   RoutingPath,
@@ -28,6 +29,7 @@ import type {
 } from '@/components/sales/types';
 
 const LEADS_TABLE = 'intake_leads';
+const LEAD_VEHICLES_TABLE = 'lead_vehicles';
 
 /** Raw intake_leads row (snake_case). */
 export interface LeadRow {
@@ -154,10 +156,121 @@ export async function getLeads(): Promise<IntakeLead[]> {
     [],
   );
   if (result.data && result.data.length > 0) {
-    return result.data.map(rowToLead);
+    const leads = result.data.map(rowToLead);
+    return attachAdditionalVehicles(leads);
   }
   ensureSeed();
-  return localLeads.map((l) => ({ ...l }));
+  return attachAdditionalVehicles(localLeads.map((l) => ({ ...l })));
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Vehicle Household Leads — vehicles beyond a lead's primary one.
+// ---------------------------------------------------------------------------
+
+interface LeadVehicleRow {
+  id: string;
+  lead_id: string;
+  vehicle_year: number | null;
+  vehicle_make: string | null;
+  vehicle_model: string | null;
+  vin: string | null;
+  severity: StormSeverity | null;
+}
+
+function rowToLeadVehicle(row: LeadVehicleRow): LeadVehicle {
+  return {
+    id: row.id,
+    vehicleYear: row.vehicle_year ?? undefined,
+    vehicleMake: row.vehicle_make ?? undefined,
+    vehicleModel: row.vehicle_model ?? undefined,
+    vin: row.vin ?? undefined,
+    severity: row.severity ?? undefined,
+  };
+}
+
+// Session-local fallback for additional vehicles, keyed by leadId — mirrors
+// every other DAL write here when the table is unavailable/unmigrated yet.
+const localLeadVehicles = new Map<string, LeadVehicle[]>();
+
+/**
+ * Attaches additionalVehicles to each lead via a single bulk query (not one
+ * query per lead) — most leads are single-vehicle, so this only matters for
+ * households a storm hit multiple vehicles at. Best-effort: a missing/
+ * unmigrated table just leaves leads without the field, same as any other
+ * DB-first-with-fallback read here.
+ */
+async function attachAdditionalVehicles(leads: IntakeLead[]): Promise<IntakeLead[]> {
+  if (leads.length === 0) return leads;
+  const byLeadId = new Map<string, LeadVehicle[]>();
+
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const { data, error } = await supabase
+      .from(LEAD_VEHICLES_TABLE)
+      .select('*')
+      .in(
+        'lead_id',
+        leads.map((l) => l.id),
+      )
+      .order('created_at', { ascending: true });
+    if (!error && data) {
+      for (const row of data as LeadVehicleRow[]) {
+        const list = byLeadId.get(row.lead_id) ?? [];
+        list.push(rowToLeadVehicle(row));
+        byLeadId.set(row.lead_id, list);
+      }
+    }
+  } catch {
+    /* fall through — local fallback below still applies per-lead */
+  }
+
+  return leads.map((lead) => {
+    const vehicles = byLeadId.get(lead.id) ?? localLeadVehicles.get(lead.id);
+    return vehicles && vehicles.length > 0 ? { ...lead, additionalVehicles: vehicles } : lead;
+  });
+}
+
+export interface AddLeadVehicleInput {
+  vehicleYear?: number;
+  vehicleMake?: string;
+  vehicleModel?: string;
+  vin?: string;
+  severity?: StormSeverity;
+}
+
+/**
+ * Adds a vehicle beyond a lead's primary one — a storm can hit more than one
+ * vehicle at the same property. DB-first with a local-fallback mirror.
+ */
+export async function addLeadVehicle(
+  leadId: string,
+  input: AddLeadVehicleInput,
+): Promise<LeadVehicle> {
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const { data, error } = await supabase
+      .from(LEAD_VEHICLES_TABLE)
+      .insert({
+        lead_id: leadId,
+        vehicle_year: input.vehicleYear ?? null,
+        vehicle_make: input.vehicleMake ?? null,
+        vehicle_model: input.vehicleModel ?? null,
+        vin: input.vin ?? null,
+        severity: input.severity ?? null,
+      })
+      .select('id')
+      .single();
+    if (!error && data) {
+      return { id: String((data as { id: string }).id), ...input };
+    }
+  } catch {
+    /* fall through to local */
+  }
+
+  const vehicle: LeadVehicle = { id: genUuid(), ...input };
+  const existing = localLeadVehicles.get(leadId) ?? [];
+  localLeadVehicles.set(leadId, [...existing, vehicle]);
+  return vehicle;
 }
 
 // Session-local store of full intake packages (document refs + signature +

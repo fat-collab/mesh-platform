@@ -329,6 +329,7 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
       return;
     }
     setSubmitting(true);
+    setScanMsg(null);
     try {
       const documents = (Object.keys(docs) as IntakeDocKind[])
         .map((k) => docs[k])
@@ -436,6 +437,9 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
       }
 
       onComplete(finalLead);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : 'Unknown error.';
+      setScanMsg(`⚠ Intake did not complete (${detail}). Please retry.`);
     } finally {
       setSubmitting(false);
     }
@@ -1069,14 +1073,21 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
               Next
             </button>
           ) : (
-            <button
-              type="button"
-              onClick={() => void submit()}
-              disabled={submitting || (requiresOnSiteSignature && (!signatureDataUrl || !agreed))}
-              className="rounded-md bg-emerald-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
-            >
-              {submitting ? 'Submitting…' : 'Submit Intake'}
-            </button>
+            <div className="flex flex-col items-end gap-1">
+              {scanMsg && (
+                <p className="max-w-[220px] rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-right text-[11px] text-red-200">
+                  {scanMsg}
+                </p>
+              )}
+              <button
+                type="button"
+                onClick={() => void submit()}
+                disabled={submitting || (requiresOnSiteSignature && (!signatureDataUrl || !agreed))}
+                className="rounded-md bg-emerald-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
+              >
+                {submitting ? 'Submitting…' : 'Submit Intake'}
+              </button>
+            </div>
           )}
         </div>
       </div>

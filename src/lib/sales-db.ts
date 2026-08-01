@@ -323,13 +323,18 @@ async function bridgeIntakeToOps(leadId: string): Promise<string> {
   leadRoMap.set(leadId, roId);
   const now = new Date().toISOString();
 
+  // organization_id is NOT NULL on repair_orders. Resolving it is a hard
+  // requirement, not best-effort: we cannot guess which tenant this write
+  // belongs to, so resolveOrganizationId() is deliberately left outside the
+  // try/catch below and allowed to throw straight out of this function.
+  const organizationId = await resolveOrganizationId();
+
   // Best-effort DB insert, routed through a Server Action: the browser's
   // anon-key client 403s on repair_orders (RLS), so the actual privileged
-  // insert runs server-side with the service-role client instead.
-  // organization_id is NOT NULL on repair_orders — resolve the same way
-  // convertLeadToRO does (session org, else first DB org as a dev fallback).
+  // insert runs server-side with the service-role client instead. Only this
+  // part — network/RLS/timeout failures on the insert itself — stays
+  // best-effort, so a field rep never loses a lead on a bad connection.
   try {
-    const organizationId = await resolveOrganizationId();
     const result = await bridgeRepairOrder({
       id: roId,
       customerName: lead.customerName,
@@ -473,8 +478,18 @@ export async function saveIntakePackage(submission: IntakeSubmission): Promise<I
   localLeads.unshift({ ...lead });
   intakePackages[id] = submission;
   // Completing a mobile intake creates a corresponding active RO on the shop
-  // floor, carrying the field walkaround / hail / document context.
-  await bridgeIntakeToOps(id);
+  // floor, carrying the field walkaround / hail / document context. This can
+  // still throw (e.g. an unresolvable tenant) — the lead itself is already
+  // persisted above by this point, but the caller needs a clear, rep-facing
+  // reason rather than a raw internal error string.
+  try {
+    await bridgeIntakeToOps(id);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Could not open the repair order for this intake (${detail}). The lead was saved — retry to finish the handoff.`,
+    );
+  }
   await maybeAutoConvertOnAobSigned(id, status, lead.claimNumber);
   return lead;
 }
@@ -797,29 +812,17 @@ export async function markRemoteAobDispatched(leadId: string, token: string): Pr
 }
 
 /**
- * Resolves an organization id to write RO/vehicle rows against: the signed-in
- * user's organization (browser session) first, falling back to the first
- * organizations row in the DB (dev fallback, e.g. for a seeded demo session
- * with no org on the profile). Returns '' when neither is available.
+ * Resolves the signed-in user's organization id to write RO/vehicle rows
+ * against. Throws rather than falling back to an arbitrary organization —
+ * a silent fallback here previously let repair orders and vehicles get
+ * written into an organization the caller didn't belong to (cross-tenant
+ * write, confirmed in live data). Callers must handle the throw; do not
+ * reintroduce a fallback that swallows it.
  */
 async function resolveOrganizationId(): Promise<string> {
-  try {
-    const profile = await getCurrentProfile(getSupabaseBrowserClient());
-    if (profile?.organizationId) return profile.organizationId;
-  } catch {
-    /* fall through to the DB default lookup below */
-  }
-  try {
-    const supabase = getSupabaseBrowserClient();
-    const { data: defaultOrg } = await supabase
-      .from('organizations')
-      .select('id')
-      .limit(1)
-      .maybeSingle();
-    return (defaultOrg as { id: string } | null)?.id ?? '';
-  } catch {
-    return '';
-  }
+  const profile = await getCurrentProfile(getSupabaseBrowserClient());
+  if (profile?.organizationId) return profile.organizationId;
+  throw new Error('Cannot resolve organization for the current session');
 }
 
 /**

@@ -13,6 +13,7 @@ import { MOCK_LEADS } from './sales-mock';
 import { MOCK_BOARD_ORDERS } from './ops-mock';
 import { bridgeRepairOrder } from '@/app/actions/intake-bridge';
 import { dispatchMobileUnit, advanceDispatchStatus } from '@/app/actions/dispatch';
+import { getCarrierIntel, CHECKLIST_ITEM_LABEL } from '@/lib/carrier-intel';
 import type {
   DamageType,
   DispatchStatus,
@@ -41,7 +42,7 @@ export interface LeadRow {
   vehicle_make?: string | null;
   vehicle_model?: string | null;
   vehicle_info?: string | null;
-  vin?: string | null;
+  vin_last8?: string | null;
   insurance_carrier?: string | null;
   claim_number?: string | null;
   estimated_amount?: number | null;
@@ -78,7 +79,7 @@ function rowToLead(row: LeadRow): IntakeLead {
     vehicleYear: row.vehicle_year ?? 0,
     vehicleMake: row.vehicle_make ?? '',
     vehicleModel: row.vehicle_model ?? '',
-    vinLast8: row.vin ?? '',
+    vinLast8: row.vin_last8 ?? '',
     insuranceCarrier: row.insurance_carrier ?? '',
     claimNumber: row.claim_number ?? '',
     status: row.status,
@@ -105,6 +106,14 @@ function rowToLead(row: LeadRow): IntakeLead {
     damageType: row.damage_type ?? undefined,
   };
 }
+
+/**
+ * Thrown by convertLeadToRO's carrier-checklist gate. Deliberately a
+ * distinct type so the DB-flow's broad catch (infrastructure failures →
+ * fall back to the local bridge) can single it out and rethrow instead of
+ * silently degrading a business-rule stop into a silently-provisioned RO.
+ */
+class CarrierChecklistIncompleteError extends Error {}
 
 function genId(prefix: string): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -412,6 +421,11 @@ async function maybeAutoConvertOnAobSigned(leadId: string, status: LeadStatus, c
  */
 export async function saveIntakePackage(submission: IntakeSubmission): Promise<IntakeLead> {
   ensureSeed();
+  // Resolves the caller's org or throws — a lead can never be written
+  // (DB or local fallback) without one. Runs before any write, local
+  // included, so a failure here blocks the whole function, not just the DB
+  // insert's best-effort path below.
+  const organizationId = await resolveOrganizationId();
   const id = genId('lead');
   const status: LeadStatus = submission.signatureDataUrl ? 'AOB_SIGNED' : 'NEW';
   const policyholderMatch = submission.policyholderMatch ?? true;
@@ -444,6 +458,7 @@ export async function saveIntakePackage(submission: IntakeSubmission): Promise<I
     const supabase = getSupabaseBrowserClient();
     const { error } = await supabase.from(LEADS_TABLE).insert({
       id: lead.id,
+      organization_id: organizationId,
       customer_name: lead.customerName,
       phone: lead.phone,
       email: lead.email,
@@ -451,7 +466,7 @@ export async function saveIntakePackage(submission: IntakeSubmission): Promise<I
       vehicle_make: lead.vehicleMake,
       vehicle_model: lead.vehicleModel,
       vehicle_info: `${lead.vehicleYear} ${lead.vehicleMake} ${lead.vehicleModel}`.trim(),
-      vin: lead.vinLast8,
+      vin_last8: lead.vinLast8,
       insurance_carrier: lead.insuranceCarrier,
       claim_number: lead.claimNumber,
       estimated_amount: lead.estimatedAmount,
@@ -523,6 +538,8 @@ export interface DigitalLeadInput {
  */
 export async function createDigitalLead(input: DigitalLeadInput): Promise<IntakeLead> {
   ensureSeed();
+  // See saveIntakePackage — resolves or throws before any write happens.
+  const organizationId = await resolveOrganizationId();
   const id = genId('lead');
   const lead: IntakeLead = {
     id,
@@ -552,6 +569,7 @@ export async function createDigitalLead(input: DigitalLeadInput): Promise<Intake
     const supabase = getSupabaseBrowserClient();
     const { error } = await supabase.from(LEADS_TABLE).insert({
       id: lead.id,
+      organization_id: organizationId,
       customer_name: lead.customerName,
       phone: lead.phone,
       email: lead.email,
@@ -602,6 +620,8 @@ export interface QuickLeadInput {
  */
 export async function createQuickLead(input: QuickLeadInput): Promise<IntakeLead> {
   ensureSeed();
+  // See saveIntakePackage — resolves or throws before any write happens.
+  const organizationId = await resolveOrganizationId();
   const id = genId('lead');
   const vehicleMake = input.vehicleMake?.trim() ?? '';
   const lead: IntakeLead = {
@@ -629,6 +649,7 @@ export async function createQuickLead(input: QuickLeadInput): Promise<IntakeLead
     const supabase = getSupabaseBrowserClient();
     const { error } = await supabase.from(LEADS_TABLE).insert({
       id: lead.id,
+      organization_id: organizationId,
       customer_name: lead.customerName,
       phone: lead.phone || null,
       vehicle_make: vehicleMake || null,
@@ -872,6 +893,12 @@ export async function convertLeadToRO(
       // lead) is not a hard failure — intercept the miss, pull the payload
       // from the active local cache, and continue provisioning the RO from
       // it instead of throwing.
+      //
+      // NOTE: documents is set to {} below — localLeads/IntakeLead doesn't
+      // retain the original IntakeDocumentRef[] captured at intake. Any lead
+      // reconstructed through this branch will therefore always show every
+      // carrier-checklist item as missing under the gate a few lines down,
+      // regardless of what was actually captured. Known gap, not fixed here.
       if (!lead) {
         ensureSeed();
         const cached = localLeads.find((l) => l.id === leadId);
@@ -880,7 +907,7 @@ export async function convertLeadToRO(
           id: cached.id,
           customer_name: cached.customerName,
           vehicle_info: `${cached.vehicleYear} ${cached.vehicleMake} ${cached.vehicleModel}`.trim(),
-          vin: cached.vinLast8 || null,
+          vin_last8: cached.vinLast8 || null,
           claim_number: cached.claimNumber || null,
           documents: {},
           walkaround_notes: {},
@@ -891,12 +918,35 @@ export async function convertLeadToRO(
         };
       }
 
+      // Carrier-checklist gate — moved here from MobileIntakeWizard's step-2
+      // canProceed(), which used to block the LEAD from being saved at all.
+      // Now the lead always saves; this blocks only RO provisioning, naming
+      // exactly what's missing so an office coordinator knows what to chase.
+      const requiredChecklist = getCarrierIntel(lead.insurance_carrier ?? '').requiredChecklist;
+      if (requiredChecklist.length > 0) {
+        const capturedKinds = new Set(
+          Array.isArray(lead.documents)
+            ? (lead.documents as IntakeDocumentRef[])
+                .filter((d) => d && typeof d === 'object' && 'kind' in d)
+                .map((d) => d.kind)
+            : [],
+        );
+        const missing = requiredChecklist.filter((kind) => !capturedKinds.has(kind));
+        if (missing.length > 0) {
+          throw new CarrierChecklistIncompleteError(
+            `Cannot open repair order — missing carrier-required documentation: ${missing
+              .map((kind) => CHECKLIST_ITEM_LABEL[kind])
+              .join(', ')}.`,
+          );
+        }
+      }
+
       // Provision vehicle record.
       const { data: vehicle, error: vehicleError } = await supabase
         .from('vehicles')
         .insert({
           organization_id: activeOrgId,
-          vin: lead.vin,
+          vin: lead.vin_last8,
           model: lead.vehicle_info,
         })
         .select('id')
@@ -952,6 +1002,10 @@ export async function convertLeadToRO(
       if (localLead) localLead.status = 'CONVERTED';
       return roId;
     } catch (err) {
+      // The checklist gate above is a business-rule stop, not an
+      // infrastructure failure — it must reach the caller, not degrade
+      // into a silently-provisioned RO via the local bridge below.
+      if (err instanceof CarrierChecklistIncompleteError) throw err;
       console.error('True DB conversion failed, falling back to local bridge:', err);
       /* falls through to the local sandbox bridge below */
     }

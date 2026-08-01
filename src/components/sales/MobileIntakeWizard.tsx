@@ -309,13 +309,13 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
         (policyholderMatch || proxyFullName.trim() !== '')
       );
     }
-    if (step === 2) {
-      // Driver's License, Insurance Card, and Prior Estimate are optional —
-      // a rep can push the lead forward instantly and fill them in later.
-      // The dynamic carrier-risk checklist stays mandatory (compliance gate,
-      // unaffected by this relaxation).
-      return carrierChecklist.every((kind) => docs[kind] !== null);
-    }
+    // Step 2: Driver's License, Insurance Card, Prior Estimate, and the
+    // carrier-required checklist are all optional to ADVANCE — a rep can
+    // push the lead forward instantly and fill them in later. The checklist
+    // is no longer a step-advance gate; it's enforced later, at RO
+    // provisioning (see convertLeadToRO), where a missing item blocks
+    // opening the repair order instead of blocking the lead from being
+    // saved. See the persistent warning rendered in the Step 2 UI below.
     if (step === 4) return !provideLoaner || selectedVehicleId !== null;
     if (step === 5) return !requiresOnSiteSignature || (signatureDataUrl !== null && agreed);
     return true;
@@ -702,8 +702,18 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                   </p>
                   <p className="text-[11px] text-zinc-500">
                     {insuranceCarrier || 'This carrier'} flags claims for scrutiny — capture these
-                    before proceeding.
+                    when possible.
                   </p>
+                  {carrierChecklist.some((kind) => !docs[kind]) && (
+                    <p className="rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1.5 text-[11px] text-red-200">
+                      ⚠ Missing: {carrierChecklist
+                        .filter((kind) => !docs[kind])
+                        .map((kind) => CHECKLIST_ITEM_LABEL[kind])
+                        .join(', ')}
+                      . The lead can still be saved, but the repair order cannot be opened until
+                      these are captured.
+                    </p>
+                  )}
                   {carrierChecklist.map((kind) => (
                     <label key={kind} className="block">
                       <span className="mb-1 block font-mono text-[11px] uppercase tracking-wider text-zinc-500">

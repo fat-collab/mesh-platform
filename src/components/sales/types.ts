@@ -62,7 +62,26 @@ export interface IntakeLead {
   remoteAobStatus?: RemoteAobStatus;
   /** Token of the active remote-aob-links record for this lead, if any. */
   remoteAobToken?: string;
+  /** Street address / property pin — captured at Quick Porch Capture or the
+   *  full intake; optional either way. */
+  address?: string;
+  /** Initial damage triage from Quick Porch Capture, refined later. */
+  damageType?: DamageType;
 }
+
+// ---------------------------------------------------------------------------
+// Quick Porch Capture
+// ---------------------------------------------------------------------------
+
+/** Initial damage triage — a rough bucket, not the final estimate scope. */
+export type DamageType = 'Collision' | 'Hail' | 'Dent' | 'Glass';
+
+export const DAMAGE_TYPE_LABEL: Record<DamageType, string> = {
+  Collision: 'Collision',
+  Hail: 'Hail / Storm',
+  Dent: 'Minor Dent / Scratch',
+  Glass: 'Windshield / Glass',
+};
 
 // ---------------------------------------------------------------------------
 // Catastrophe Legal & Carrier Intelligence Shield

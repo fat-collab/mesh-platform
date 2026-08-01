@@ -35,6 +35,7 @@ import { MOCK_BOARD_ORDERS } from '@/lib/ops-mock';
 import { STAGE_META } from '@/lib/board';
 import type { RoStage } from '@/lib/database.types';
 import { MobileIntakeWizard } from '@/components/sales/MobileIntakeWizard';
+import { QuickLeadModal } from '@/components/sales/QuickLeadModal';
 import { DigitalIntakeQuickAdd } from '@/components/sales/DigitalIntakeQuickAdd';
 import { LeadActionCard } from '@/components/sales/LeadActionCard';
 import { LeadOwnerChip } from '@/components/sales/LeadOwnerChip';
@@ -282,6 +283,7 @@ export default function SalesIntakePage() {
   const [notice, setNotice] = useState<string | null>(null);
   const [tab, setTab] = useState<LeadChannel>('DIGITAL_INBOUND');
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [quickLeadOpen, setQuickLeadOpen] = useState(false);
   const [digitalAddOpen, setDigitalAddOpen] = useState(false);
   const [showClosed, setShowClosed] = useState(false);
   const [showCommission, setShowCommission] = useState(false);
@@ -414,13 +416,22 @@ export default function SalesIntakePage() {
                 + Add New Lead
               </button>
             ) : (
-              <button
-                type="button"
-                onClick={() => setWizardOpen(true)}
-                className="rounded-md bg-sky-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-sky-500"
-              >
-                + New Mobile Intake
-              </button>
+              <>
+                <button
+                  type="button"
+                  onClick={() => setQuickLeadOpen(true)}
+                  className="rounded-md border border-sky-600/50 px-4 py-2 text-sm font-semibold text-sky-300 transition-colors hover:bg-sky-500/10"
+                >
+                  ⚡ Quick Capture
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setWizardOpen(true)}
+                  className="rounded-md bg-sky-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-sky-500"
+                >
+                  + New Mobile Intake
+                </button>
+              </>
             )}
           </div>
         </header>
@@ -555,6 +566,17 @@ export default function SalesIntakePage() {
                 ? `Mobile intake captured for ${lead.customerName} — Remote AOB link sent to the proxy policyholder.`
                 : `Mobile intake captured — new lead created for ${lead.customerName}.`,
             );
+          }}
+        />
+      )}
+
+      {quickLeadOpen && (
+        <QuickLeadModal
+          onClose={() => setQuickLeadOpen(false)}
+          onComplete={(lead) => {
+            setLeads((prev) => [lead, ...prev]);
+            setQuickLeadOpen(false);
+            setNotice(`Quick lead captured for ${lead.customerName}.`);
           }}
         />
       )}

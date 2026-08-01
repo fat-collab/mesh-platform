@@ -14,6 +14,7 @@ import { MOCK_BOARD_ORDERS } from './ops-mock';
 import { bridgeRepairOrder } from '@/app/actions/intake-bridge';
 import { dispatchMobileUnit, advanceDispatchStatus } from '@/app/actions/dispatch';
 import type {
+  DamageType,
   DispatchStatus,
   IntakeDocumentRef,
   IntakeLead,
@@ -62,6 +63,8 @@ export interface LeadRow {
   proxy_policyholder?: ProxyPolicyholder | null;
   remote_aob_status?: RemoteAobStatus | null;
   remote_aob_token?: string | null;
+  address?: string | null;
+  damage_type?: DamageType | null;
 }
 
 function rowToLead(row: LeadRow): IntakeLead {
@@ -96,6 +99,8 @@ function rowToLead(row: LeadRow): IntakeLead {
     proxyPolicyholder: row.proxy_policyholder ?? undefined,
     remoteAobStatus: row.remote_aob_status ?? undefined,
     remoteAobToken: row.remote_aob_token ?? undefined,
+    address: row.address ?? undefined,
+    damageType: row.damage_type ?? undefined,
   };
 }
 
@@ -441,6 +446,73 @@ export async function createDigitalLead(input: DigitalLeadInput): Promise<Intake
       policyholder_match: lead.policyholderMatch,
       proxy_policyholder: lead.proxyPolicyholder ?? null,
       remote_aob_status: lead.remoteAobStatus ?? null,
+    });
+    if (error) {
+      /* fall through to local store */
+    }
+  } catch {
+    /* fall through to local store */
+  }
+
+  localLeads.unshift({ ...lead });
+  return lead;
+}
+
+export interface QuickLeadInput {
+  customerName: string;
+  phone?: string;
+  address?: string;
+  vehicleMake?: string;
+  damageType?: DamageType;
+}
+
+/**
+ * Quick Porch Capture — the fastest possible lead entry: a rep standing at a
+ * customer's door needs to grab a name (the only required field) before
+ * anything else, filling in the rest via the full intake later. Attempts a
+ * DB insert first; always mirrors to the local store as the fallback.
+ */
+export async function createQuickLead(input: QuickLeadInput): Promise<IntakeLead> {
+  ensureSeed();
+  const id = genId('lead');
+  const vehicleMake = input.vehicleMake?.trim() ?? '';
+  const lead: IntakeLead = {
+    id,
+    customerName: input.customerName.trim(),
+    phone: input.phone?.trim() ?? '',
+    email: '',
+    vehicleYear: 0,
+    vehicleMake,
+    vehicleModel: '',
+    vinLast8: '',
+    insuranceCarrier: '',
+    claimNumber: '',
+    status: 'NEW',
+    intakeDate: new Date().toISOString(),
+    estimatedAmount: 0,
+    // A rep on-site at the customer's property is the same field-capture
+    // context the mobile intake wizard uses.
+    channel: 'FIELD_DISPATCH',
+    address: input.address?.trim() || undefined,
+    damageType: input.damageType,
+  };
+
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const { error } = await supabase.from(LEADS_TABLE).insert({
+      id: lead.id,
+      customer_name: lead.customerName,
+      phone: lead.phone || null,
+      vehicle_make: vehicleMake || null,
+      vehicle_info: vehicleMake ? `${vehicleMake} (Pending Details)` : null,
+      status: lead.status,
+      created_at: lead.intakeDate,
+      agreement_accepted: false,
+      documents: [],
+      walkaround_notes: [],
+      channel: lead.channel,
+      address: lead.address ?? null,
+      damage_type: lead.damageType ?? null,
     });
     if (error) {
       /* fall through to local store */

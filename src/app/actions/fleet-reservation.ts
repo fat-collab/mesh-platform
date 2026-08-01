@@ -8,7 +8,7 @@
  * for consistency with intake-bridge.ts's Server Action pattern for
  * privileged-ish writes triggered from the sales pipeline.
  */
-import { createSupabaseServerClient } from '@/lib/supabase';
+import { createSupabaseServerClient } from '@/lib/supabase-server';
 
 export interface ReserveVehicleInput {
   vehicleId: string;

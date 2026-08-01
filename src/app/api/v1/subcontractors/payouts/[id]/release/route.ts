@@ -12,7 +12,7 @@
  * 404 / 400: { success: false, error }
  */
 import { NextResponse } from 'next/server';
-import { createSupabaseServerClient } from '@/lib/supabase';
+import { createSupabaseServerClient } from '@/lib/supabase-server';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';

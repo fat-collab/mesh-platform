@@ -9,7 +9,7 @@
  * RLS the same way the existing API routes using createSupabaseServerClient
  * already do (see src/lib/supabase.ts).
  */
-import { createSupabaseServerClient } from '@/lib/supabase';
+import { createSupabaseServerClient } from '@/lib/supabase-server';
 
 export interface BridgeRepairOrderInput {
   /** Repair order id — must be a genUuid()-generated id (native Postgres

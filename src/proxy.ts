@@ -12,7 +12,7 @@
  */
 import { createServerClient } from '@supabase/ssr';
 import { NextResponse, type NextRequest } from 'next/server';
-import { supabaseUrl, supabaseAnonKey } from '@/lib/supabase';
+import { supabaseUrl, supabasePublishableKey } from '@/lib/supabase';
 
 export async function proxy(request: NextRequest) {
   const requestHeaders = new Headers(request.headers);
@@ -20,7 +20,7 @@ export async function proxy(request: NextRequest) {
 
   let response = NextResponse.next({ request: { headers: requestHeaders } });
 
-  const supabase = createServerClient(supabaseUrl, supabaseAnonKey, {
+  const supabase = createServerClient(supabaseUrl, supabasePublishableKey, {
     cookies: {
       getAll() {
         return request.cookies.getAll();

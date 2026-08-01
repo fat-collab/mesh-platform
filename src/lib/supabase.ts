@@ -1,15 +1,22 @@
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 import { createBrowserClient } from '@supabase/ssr';
 
-// Fallback values keep the app runnable without a populated .env.local (this
-// is the linked demo project's own public URL/anon key, safe to ship as a
-// default). Real env vars still take precedence when set.
-export const supabaseUrl =
-  process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://jgvjbugncpmcxveuhjgj.supabase.co';
+function requireEnv(name: string, value: string | undefined): string {
+  if (!value) {
+    throw new Error(`${name} is not set — refusing to start with a missing Supabase credential.`);
+  }
+  return value;
+}
 
-export const supabaseAnonKey =
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
-  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpndmpidWduY3BtY3h2ZXVoamdqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4NDg2Nzc1OCwiZXhwIjoyMTAwNDQzNzU4fQ.mHwZW9ykXwIbCjZdHyKpWVyNiDwIYv2e2-GFjGmMfTA';
+export const supabaseUrl = requireEnv(
+  'NEXT_PUBLIC_SUPABASE_URL',
+  process.env.NEXT_PUBLIC_SUPABASE_URL,
+);
+
+export const supabasePublishableKey = requireEnv(
+  'NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY',
+  process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
+);
 
 // Next.js dev Fast Refresh can re-evaluate this module on unrelated edits,
 // which used to spawn a fresh GoTrueClient each time ("Multiple GoTrueClient
@@ -22,7 +29,7 @@ const globalForSupabase = globalThis as unknown as {
 };
 
 export const supabase =
-  globalForSupabase.__meshSupabase ?? createSupabaseClient(supabaseUrl, supabaseAnonKey);
+  globalForSupabase.__meshSupabase ?? createSupabaseClient(supabaseUrl, supabasePublishableKey);
 
 if (process.env.NODE_ENV !== 'production') {
   globalForSupabase.__meshSupabase = supabase;
@@ -39,7 +46,7 @@ let browserClient: ReturnType<typeof createBrowserClient> | undefined =
 
 export function getSupabaseBrowserClient() {
   if (!browserClient) {
-    browserClient = createBrowserClient(supabaseUrl, supabaseAnonKey);
+    browserClient = createBrowserClient(supabaseUrl, supabasePublishableKey);
     globalForSupabase.__meshSupabaseBrowser = browserClient;
   }
   return browserClient;
@@ -49,24 +56,17 @@ export function getSupabaseBrowserClient() {
  * The concrete Supabase client type used across the DAL. Deliberately derived
  * from getSupabaseBrowserClient (not the bare `supabase` singleton): passing
  * an options object to createClient — as createSupabaseUserClient,
- * createSupabaseServerClient, and @supabase/ssr's createBrowserClient all do —
- * resolves a different (newer) SupabaseClient generic shape than a bare
- * no-options createClient(url, key) call. Every real call site uses one of
- * the "with options" clients, so this is the shape that actually matches them.
+ * createSupabaseServerClient (src/lib/supabase-server.ts), and @supabase/ssr's
+ * createBrowserClient all do — resolves a different (newer) SupabaseClient
+ * generic shape than a bare no-options createClient(url, key) call. Every
+ * real call site uses one of the "with options" clients, so this is the shape
+ * that actually matches them.
  */
 export type MeshSupabaseClient = ReturnType<typeof getSupabaseBrowserClient>;
 
-/** Service-role (admin) client — bypasses RLS. Server-only. */
-export function createSupabaseServerClient() {
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || supabaseAnonKey;
-  return createSupabaseClient(supabaseUrl, serviceKey, {
-    auth: { persistSession: false },
-  });
-}
-
 /** User-scoped client — runs queries under the caller's JWT (RLS enforced). */
 export function createSupabaseUserClient(accessToken: string) {
-  return createSupabaseClient(supabaseUrl, supabaseAnonKey, {
+  return createSupabaseClient(supabaseUrl, supabasePublishableKey, {
     global: { headers: { Authorization: `Bearer ${accessToken}` } },
     auth: { persistSession: false },
   });

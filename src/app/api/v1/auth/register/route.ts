@@ -18,7 +18,7 @@
  */
 import { NextResponse } from 'next/server';
 import { Resend } from 'resend';
-import { createSupabaseServerClient } from '@/lib/supabase';
+import { createSupabaseServerClient } from '@/lib/supabase-server';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';

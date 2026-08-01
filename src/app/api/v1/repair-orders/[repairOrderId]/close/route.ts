@@ -17,7 +17,7 @@
  * column — it uses `lifecycle_status`; "pending" here means not yet PAID.
  */
 import { NextResponse } from 'next/server';
-import { createSupabaseServerClient } from '@/lib/supabase';
+import { createSupabaseServerClient } from '@/lib/supabase-server';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';

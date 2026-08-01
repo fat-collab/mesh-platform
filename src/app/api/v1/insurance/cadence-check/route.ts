@@ -10,7 +10,7 @@
  * bumps nudge_count + last_nudge_at, and logs each action to audit_logs.
  */
 import { NextResponse } from 'next/server';
-import { createSupabaseServerClient } from '@/lib/supabase';
+import { createSupabaseServerClient } from '@/lib/supabase-server';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';

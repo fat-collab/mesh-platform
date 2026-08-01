@@ -194,7 +194,7 @@ export interface ScopeLineItem {
 export interface SupplementPackage {
   id: string;
   claimNumber: string;
-  status: 'DRAFT' | 'SUBMITTED' | 'APPROVED' | 'REJECTED';
+  status: 'DRAFT' | 'SUBMITTED' | 'APPROVED' | 'DENIED';
   items: ScopeLineItem[];
   totalDelta: number;
   adjusterNotes: string;

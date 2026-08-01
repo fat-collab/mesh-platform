@@ -11,7 +11,7 @@
  * MANAGER/EXECUTIVE, replacing the "Dispatch Mobile" control that used to
  * live on Sales' RoutingActionPanel).
  */
-import { createSupabaseServerClient } from '@/lib/supabase';
+import { createSupabaseServerClient } from '@/lib/supabase-server';
 import type { DispatchStatus } from '@/components/sales/types';
 
 const LEADS_TABLE = 'intake_leads';

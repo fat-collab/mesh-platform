@@ -24,7 +24,7 @@ const STATUS_TONE: Record<SupplementPackage['status'], string> = {
   DRAFT: 'border-zinc-600/60 bg-zinc-700/40 text-zinc-200',
   SUBMITTED: 'border-sky-500/40 bg-sky-500/15 text-sky-200',
   APPROVED: 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200',
-  REJECTED: 'border-red-500/40 bg-red-500/15 text-red-200',
+  DENIED: 'border-red-500/40 bg-red-500/15 text-red-200',
 };
 
 const money = (n: number) => `$${n.toFixed(2)}`;

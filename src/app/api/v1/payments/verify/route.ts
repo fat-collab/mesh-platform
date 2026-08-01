@@ -32,10 +32,8 @@
  *   - `payout_splits.net_payout` and child `organization_id` are set by triggers.
  */
 import { NextResponse } from 'next/server';
-import {
-  createSupabaseServerClient,
-  createSupabaseUserClient,
-} from '@/lib/supabase';
+import { createSupabaseServerClient } from '@/lib/supabase-server';
+import { createSupabaseUserClient } from '@/lib/supabase';
 import {
   PayoutError,
   StripeConfigError,

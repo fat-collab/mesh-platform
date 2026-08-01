@@ -54,3 +54,21 @@ Database tables must include:
   type (single import surface; types-only, safe on client or server).
 - No Prisma/Drizzle and no central data store — data access is per-feature under
   `src/lib/`, each DB-first with a session/JSON fallback.
+
+## 6. Naming Decisions (audit resolution)
+
+1. `ro_id` is CORRECT and stays. RO is industry-standard shorthand, same
+   class as `vin` and `rsa`. Do not rename to `repair_order_id`. This
+   supersedes any generic `<table_singular>_id` convention.
+2. Approved abbreviations: `vin`, `rsa`, `ro`. All other columns spell out.
+3. `repair_order_supplements.status`: `DENIED` is canonical. RESOLVED — TS
+   aligned to DB (types.ts, SupplementsPanel.tsx); no migration was required
+   since the DB check constraint already accepted DENIED. Zero REJECTED
+   occurrences remain.
+4. `rental_vehicles.assigned_ro_id` stores `intake_leads.id` values, NOT
+   repair order ids. Do not join it to `repair_orders`. Rename pending.
+5. `intake_leads.id` is text, not uuid, and this is deliberate — local
+   fallback IDs are not valid UUIDs. Do not "fix" it without a
+   coordinated ID-generation migration.
+6. `database.types.ts` is stale. Migrations are the source of truth.
+   Regenerate with: `supabase gen types typescript --project-id <ref>`

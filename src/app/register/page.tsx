@@ -110,6 +110,10 @@ export default function RegisterPage() {
         <div className="mb-6 text-center">
           <h1 className="text-2xl font-bold tracking-tight">MESH</h1>
           <p className="mt-1 text-sm text-zinc-400">Set up your shop&apos;s Ops Cockpit</p>
+          <p className="mt-1 text-xs text-zinc-600">
+            This creates a brand-new shop. Joining a shop that&apos;s already on MESH? You&apos;ll
+            need an invite link from its owner instead — this form isn&apos;t it.
+          </p>
         </div>
 
         <form

@@ -179,6 +179,10 @@ export default function LoginPage() {
             Create an account
           </Link>
         </p>
+        <p className="mt-2 text-center text-xs text-zinc-600">
+          Joining an existing shop? You&apos;ll need an invite link from your shop owner — check
+          your email, or ask them to send one.
+        </p>
       </div>
     </div>
   );

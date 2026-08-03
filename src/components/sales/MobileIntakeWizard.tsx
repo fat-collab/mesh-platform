@@ -20,6 +20,7 @@ import {
   addRentalLoanDriver,
   getAvailableVehicles,
   getRentalHandoverRequirements,
+  isHandoverItemSatisfied,
   type RentalHandoverRequirements,
 } from '@/lib/rental-db';
 import { getCurrentProfile } from '@/lib/auth';
@@ -167,9 +168,24 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
   const [driverName, setDriverName] = useState('');
   const [driverLicenseFile, setDriverLicenseFile] = useState<IntakeDocumentRef | null>(null);
   const [driverInsuranceFile, setDriverInsuranceFile] = useState<IntakeDocumentRef | null>(null);
+  // ATTESTED_DATA typed fields — a rep who verified the physical card/app
+  // can type what it says instead of photographing it. Named distinctly
+  // from the customer's own insuranceCarrier/policyNumber (Step 1, for the
+  // claim) — this is the DRIVER's own license/insurance, an unrelated
+  // concept that happens to reuse similar words.
+  const [driverLicenseNumber, setDriverLicenseNumber] = useState('');
+  const [driverLicenseExpiry, setDriverLicenseExpiry] = useState('');
+  const [driverInsuranceCarrier, setDriverInsuranceCarrier] = useState('');
+  const [driverPolicyNumber, setDriverPolicyNumber] = useState('');
+  const [driverPolicyExpiry, setDriverPolicyExpiry] = useState('');
+  // Attestation — independent per item, per the three-level model.
+  const [licenseAttested, setLicenseAttested] = useState(false);
+  const [insuranceAttested, setInsuranceAttested] = useState(false);
+  const [rentalAgreementAttested, setRentalAgreementAttested] = useState(false);
   const [handoverRequirements, setHandoverRequirements] = useState<RentalHandoverRequirements>({
-    driverLicense: 'BLOCK',
-    proofOfInsurance: 'BLOCK',
+    driversLicense: 'DOCUMENT',
+    driverInsurance: 'DOCUMENT',
+    rentalAgreement: 'DOCUMENT',
   });
 
   // Step 5 — repair AOB signature (Named Insured on-site only; deferred to
@@ -259,17 +275,38 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
   // The AOB is signed on-site only when the Named Insured is present;
   // otherwise it defers entirely to the Remote AOB Execution Gate.
   const requiresAobSignature = policyholderMatch;
-  // The Rental / Loaner Agreement is its own document, needed whenever a
-  // loaner is issued at all — regardless of who's driving. Previously this
-  // only fired for a proxy taking custody (rentalOperator.source ===
-  // 'PROXY'); a loaner issued to the Named Insured needs exactly the same
-  // signature and previously got none of its own.
-  const requiresRentalSignature = provideLoaner;
+  // The Rental / Loaner Agreement's signature pad is a hard, step-advance-
+  // blocking requirement (like the AOB) ONLY when the shop has this item
+  // set to DOCUMENT — the strictest of the three levels. ATTESTED_DATA and
+  // NONE are handled below via handoverAllowed instead, the same
+  // non-blocking path drivers_license/driver_insurance already use: a rep
+  // can still finish and save the intake, and the vehicle simply holds
+  // RESERVED instead of being released. Only an actual required signature
+  // is treated as a submit-blocking legal document, same as the AOB.
+  const requiresRentalSignature = provideLoaner && handoverRequirements.rentalAgreement === 'DOCUMENT';
+
+  const driversLicenseSatisfied = isHandoverItemSatisfied(handoverRequirements.driversLicense, {
+    hasTypedData: driverLicenseNumber.trim() !== '' && driverLicenseExpiry.trim() !== '',
+    attested: licenseAttested,
+    hasDocument: driverLicenseFile !== null,
+  });
+  const driverInsuranceSatisfied = isHandoverItemSatisfied(handoverRequirements.driverInsurance, {
+    hasTypedData: driverInsuranceCarrier.trim() !== '' && driverPolicyNumber.trim() !== '',
+    attested: insuranceAttested,
+    hasDocument: driverInsuranceFile !== null,
+  });
+  // hasTypedData: true — the rental agreement's ATTESTED_DATA path has no
+  // separate typed fields of its own (unlike license/insurance); the
+  // attestation itself IS the data being asserted.
+  const rentalAgreementItemSatisfied = isHandoverItemSatisfied(handoverRequirements.rentalAgreement, {
+    hasTypedData: true,
+    attested: rentalAgreementAttested,
+    hasDocument: rentalSignatureDataUrl !== null,
+  });
 
   const handoverAllowed =
     !provideLoaner ||
-    ((driverLicenseFile !== null || handoverRequirements.driverLicense !== 'BLOCK') &&
-      (driverInsuranceFile !== null || handoverRequirements.proofOfInsurance !== 'BLOCK'));
+    (driversLicenseSatisfied && driverInsuranceSatisfied && rentalAgreementItemSatisfied);
 
   const setDoc = (kind: IntakeDocKind, file: File | undefined) => {
     if (!file) return;
@@ -499,12 +536,25 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
         // Records who actually took the keys — may differ from the AOB
         // signer above. Best-effort internally (see rental-db.ts); never
         // throws, so it can't block the rest of submit.
+        const attestedBy = assignedStaffName.trim() || 'Rep';
+        const nowIso = new Date().toISOString();
         await addRentalLoanDriver({
           rentalVehicleId: rental.vehicleId,
           leadId: lead.id,
           driverName: rental.driverName,
           licenseDocumentUrl: rental.driverLicenseDocUrl,
           insuranceDocumentUrl: rental.driverInsuranceDocUrl,
+          licenseNumber: driverLicenseNumber.trim() || null,
+          licenseExpiry: driverLicenseExpiry || null,
+          insuranceCarrier: driverInsuranceCarrier.trim() || null,
+          policyNumber: driverPolicyNumber.trim() || null,
+          policyExpiry: driverPolicyExpiry || null,
+          driversLicenseAttestedBy: licenseAttested ? attestedBy : null,
+          driversLicenseAttestedAt: licenseAttested ? nowIso : null,
+          driverInsuranceAttestedBy: insuranceAttested ? attestedBy : null,
+          driverInsuranceAttestedAt: insuranceAttested ? nowIso : null,
+          rentalAgreementAttestedBy: rentalAgreementAttested ? attestedBy : null,
+          rentalAgreementAttestedAt: rentalAgreementAttested ? nowIso : null,
         });
       }
 
@@ -1018,7 +1068,7 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                         onChange={(e) => setLoanerPreDamage(e.target.value)}
                       />
 
-                      <div className="space-y-2 rounded-md border border-zinc-700 bg-zinc-800/40 p-2.5">
+                      <div className="space-y-3 rounded-md border border-zinc-700 bg-zinc-800/40 p-2.5">
                         <p className="font-mono text-[11px] uppercase tracking-wider text-zinc-500">
                           Driver taking the keys{' '}
                           <span className="normal-case text-zinc-600">
@@ -1031,82 +1081,141 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                           value={driverName}
                           onChange={(e) => setDriverName(e.target.value)}
                         />
-                        <div className="grid grid-cols-2 gap-2">
-                          <label className="block">
-                            <span className="mb-1 flex items-center gap-1 text-[10px] text-zinc-500">
+
+                        {handoverRequirements.driversLicense !== 'NONE' && (
+                          <div className="space-y-1.5 border-t border-zinc-700/70 pt-2">
+                            <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-zinc-500">
                               Driver&apos;s license
-                              <span
-                                className={clsx(
-                                  'rounded px-1 py-0.5 font-semibold',
-                                  handoverRequirements.driverLicense === 'BLOCK'
-                                    ? 'bg-red-500/15 text-red-300'
-                                    : 'bg-amber-500/15 text-amber-300',
-                                )}
-                              >
-                                {handoverRequirements.driverLicense}
+                              <span className="rounded bg-zinc-700 px-1 py-0.5 font-semibold text-zinc-300">
+                                {handoverRequirements.driversLicense}
                               </span>
                             </span>
-                            <input
-                              type="file"
-                              accept="image/*"
-                              onChange={(e) => {
-                                const f = e.target.files?.[0];
-                                if (f) {
-                                  setDriverLicenseFile({
-                                    kind: 'DL_FRONT',
-                                    fileName: f.name,
-                                    url: URL.createObjectURL(f),
-                                  });
-                                }
-                              }}
-                              className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
-                            />
-                            {driverLicenseFile && (
-                              <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
-                                ✓ {driverLicenseFile.fileName}
-                              </span>
+                            {handoverRequirements.driversLicense === 'DOCUMENT' ? (
+                              <>
+                                <input
+                                  type="file"
+                                  accept="image/*"
+                                  onChange={(e) => {
+                                    const f = e.target.files?.[0];
+                                    if (f) {
+                                      setDriverLicenseFile({
+                                        kind: 'DL_FRONT',
+                                        fileName: f.name,
+                                        url: URL.createObjectURL(f),
+                                      });
+                                    }
+                                  }}
+                                  className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
+                                />
+                                {driverLicenseFile && (
+                                  <span className="block truncate text-[11px] text-emerald-300">
+                                    ✓ {driverLicenseFile.fileName}
+                                  </span>
+                                )}
+                              </>
+                            ) : (
+                              <>
+                                <div className="grid grid-cols-2 gap-1.5">
+                                  <input
+                                    className={input}
+                                    placeholder="License #"
+                                    value={driverLicenseNumber}
+                                    onChange={(e) => setDriverLicenseNumber(e.target.value)}
+                                  />
+                                  <input
+                                    type="date"
+                                    className={input}
+                                    value={driverLicenseExpiry}
+                                    onChange={(e) => setDriverLicenseExpiry(e.target.value)}
+                                  />
+                                </div>
+                                <label className="flex items-start gap-2 text-[11px] text-zinc-300">
+                                  <input
+                                    type="checkbox"
+                                    checked={licenseAttested}
+                                    onChange={(e) => setLicenseAttested(e.target.checked)}
+                                    className="mt-0.5"
+                                  />
+                                  I verified this license number and expiration date against the
+                                  physical card or the driver&apos;s app.
+                                </label>
+                              </>
                             )}
-                          </label>
-                          <label className="block">
-                            <span className="mb-1 flex items-center gap-1 text-[10px] text-zinc-500">
+                          </div>
+                        )}
+
+                        {handoverRequirements.driverInsurance !== 'NONE' && (
+                          <div className="space-y-1.5 border-t border-zinc-700/70 pt-2">
+                            <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-zinc-500">
                               Proof of insurance
-                              <span
-                                className={clsx(
-                                  'rounded px-1 py-0.5 font-semibold',
-                                  handoverRequirements.proofOfInsurance === 'BLOCK'
-                                    ? 'bg-red-500/15 text-red-300'
-                                    : 'bg-amber-500/15 text-amber-300',
-                                )}
-                              >
-                                {handoverRequirements.proofOfInsurance}
+                              <span className="rounded bg-zinc-700 px-1 py-0.5 font-semibold text-zinc-300">
+                                {handoverRequirements.driverInsurance}
                               </span>
                             </span>
-                            <input
-                              type="file"
-                              accept="image/*"
-                              onChange={(e) => {
-                                const f = e.target.files?.[0];
-                                if (f) {
-                                  setDriverInsuranceFile({
-                                    kind: 'INSURANCE_CARD',
-                                    fileName: f.name,
-                                    url: URL.createObjectURL(f),
-                                  });
-                                }
-                              }}
-                              className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
-                            />
-                            {driverInsuranceFile && (
-                              <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
-                                ✓ {driverInsuranceFile.fileName}
-                              </span>
+                            {handoverRequirements.driverInsurance === 'DOCUMENT' ? (
+                              <>
+                                <input
+                                  type="file"
+                                  accept="image/*"
+                                  onChange={(e) => {
+                                    const f = e.target.files?.[0];
+                                    if (f) {
+                                      setDriverInsuranceFile({
+                                        kind: 'INSURANCE_CARD',
+                                        fileName: f.name,
+                                        url: URL.createObjectURL(f),
+                                      });
+                                    }
+                                  }}
+                                  className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
+                                />
+                                {driverInsuranceFile && (
+                                  <span className="block truncate text-[11px] text-emerald-300">
+                                    ✓ {driverInsuranceFile.fileName}
+                                  </span>
+                                )}
+                              </>
+                            ) : (
+                              <>
+                                <input
+                                  className={input}
+                                  placeholder="Insurance carrier"
+                                  value={driverInsuranceCarrier}
+                                  onChange={(e) => setDriverInsuranceCarrier(e.target.value)}
+                                />
+                                <div className="grid grid-cols-2 gap-1.5">
+                                  <input
+                                    className={input}
+                                    placeholder="Policy #"
+                                    value={driverPolicyNumber}
+                                    onChange={(e) => setDriverPolicyNumber(e.target.value)}
+                                  />
+                                  <input
+                                    type="date"
+                                    className={input}
+                                    value={driverPolicyExpiry}
+                                    onChange={(e) => setDriverPolicyExpiry(e.target.value)}
+                                  />
+                                </div>
+                                <label className="flex items-start gap-2 text-[11px] text-zinc-300">
+                                  <input
+                                    type="checkbox"
+                                    checked={insuranceAttested}
+                                    onChange={(e) => setInsuranceAttested(e.target.checked)}
+                                    className="mt-0.5"
+                                  />
+                                  I verified this insurance carrier and policy against the physical
+                                  card or the driver&apos;s app.
+                                </label>
+                              </>
                             )}
-                          </label>
-                        </div>
+                          </div>
+                        )}
+
                         {!handoverAllowed && (
                           <p className="text-[11px] text-amber-300">
-                            ⚠ This shop requires the missing document(s) above before the keys can
-                            be released. The intake will still save and the vehicle will be held
+                            ⚠ This shop requires the missing item(s) above before the keys can be
+                            released. The intake will still save and the vehicle will be held
                             RESERVED — nothing here blocks submitting.
                           </p>
                         )}
@@ -1166,33 +1275,50 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
           )}
 
           {/* Rental / Loaner Agreement — a legally separate document from the
-              AOB above. Rendered whenever a loaner is being issued at all,
-              regardless of policyholderMatch or who the driver is. */}
-          {step === 5 && provideLoaner && (
+              AOB above. Rendered whenever a loaner is being issued at all
+              AND the shop requires something for it (NONE hides this
+              entirely), regardless of policyholderMatch or who's driving. */}
+          {step === 5 && provideLoaner && handoverRequirements.rentalAgreement !== 'NONE' && (
             <>
               <RentalAgreementText operator={rentalOperator} />
               <p className="text-[11px] text-amber-200">
                 {driverName || rentalOperator.name || 'The driver'} is taking custody of the loaner
-                today. This Rental / Loaner Agreement is signed separately from the repair AOB
+                today. This Rental / Loaner Agreement is handled separately from the repair AOB
                 {!policyholderMatch ? ', which the policyholder signs remotely' : ''}.
               </p>
-              <label className="flex items-start gap-2 text-xs text-zinc-300">
-                <input
-                  type="checkbox"
-                  checked={rentalAgreed}
-                  onChange={(e) => setRentalAgreed(e.target.checked)}
-                  className="mt-0.5"
-                />
-                I have read and accept the Rental / Loaner Agreement on behalf of{' '}
-                {driverName || rentalOperator.name || 'the driver'}, and authorize release of the
-                vehicle.
-              </label>
-              <div>
-                <p className="mb-1 font-mono text-[11px] uppercase tracking-wider text-zinc-500">
-                  {driverName || rentalOperator.name || 'Driver'} signature (Rental Agreement)
-                </p>
-                <SignaturePad onChange={setRentalSignatureDataUrl} />
-              </div>
+              {handoverRequirements.rentalAgreement === 'DOCUMENT' ? (
+                <>
+                  <label className="flex items-start gap-2 text-xs text-zinc-300">
+                    <input
+                      type="checkbox"
+                      checked={rentalAgreed}
+                      onChange={(e) => setRentalAgreed(e.target.checked)}
+                      className="mt-0.5"
+                    />
+                    I have read and accept the Rental / Loaner Agreement on behalf of{' '}
+                    {driverName || rentalOperator.name || 'the driver'}, and authorize release of
+                    the vehicle.
+                  </label>
+                  <div>
+                    <p className="mb-1 font-mono text-[11px] uppercase tracking-wider text-zinc-500">
+                      {driverName || rentalOperator.name || 'Driver'} signature (Rental Agreement)
+                    </p>
+                    <SignaturePad onChange={setRentalSignatureDataUrl} />
+                  </div>
+                </>
+              ) : (
+                <label className="flex items-start gap-2 text-xs text-zinc-300">
+                  <input
+                    type="checkbox"
+                    checked={rentalAgreementAttested}
+                    onChange={(e) => setRentalAgreementAttested(e.target.checked)}
+                    className="mt-0.5"
+                  />
+                  I confirm {driverName || rentalOperator.name || 'the driver'} reviewed and
+                  verbally accepted the Rental / Loaner Agreement terms above — this shop does not
+                  require a written signature for it.
+                </label>
+              )}
             </>
           )}
 
@@ -1244,11 +1370,13 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                       label="Rental agreement accepted"
                       value={rentalAgreed ? '✓ Accepted' : '✗ Not accepted'}
                     />
-                    <Row
-                      label="Driver documents"
-                      value={handoverAllowed ? '✓ OK to release' : '⚠ Missing — will hold RESERVED'}
-                    />
                   </>
+                )}
+                {provideLoaner && (
+                  <Row
+                    label="Handover requirements"
+                    value={handoverAllowed ? '✓ OK to release' : '⚠ Missing — will hold RESERVED'}
+                  />
                 )}
               </dl>
               {requiresAobSignature && (!signatureDataUrl || !agreed) && (
@@ -1261,11 +1389,11 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                   Rental agreement signature and acceptance are required (Step 5) before submitting.
                 </p>
               )}
-              {requiresRentalSignature && !handoverAllowed && (
+              {provideLoaner && !handoverAllowed && (
                 <p className="text-[11px] text-amber-300">
-                  Missing driver document(s) (Step 4) — the intake will still save, but this
-                  vehicle will stay RESERVED instead of being released. Complete the document(s) in
-                  Fleet to release it.
+                  Missing handover requirement(s) above (Steps 4–5) — the intake will still save,
+                  but this vehicle will stay RESERVED instead of being released. Complete the
+                  requirement(s) in Fleet to release it.
                 </p>
               )}
             </div>

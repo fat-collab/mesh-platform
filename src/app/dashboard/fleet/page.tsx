@@ -16,7 +16,9 @@ import {
   addRentalLoanDriver,
   getFleet,
   getLatestLoanDriver,
+  getLeadRentalAgreementSignature,
   getRentalHandoverRequirements,
+  isHandoverItemSatisfied,
   removeVehicle,
   returnVehicle,
   setVehicleStatus,
@@ -40,20 +42,30 @@ export default function FleetPage() {
   const [assignCustomer, setAssignCustomer] = useState('');
   const [assignAgent, setAssignAgent] = useState('');
   const [assignMileage, setAssignMileage] = useState('');
-  // Driver-document handover gate — only meaningful for a RESERVED unit's
-  // Confirm Pickup (the moment keys actually change hands for a loaner the
-  // mobile wizard held back). A fresh walk-in Assign from AVAILABLE is not
-  // gated here — out of scope for this pass.
+  // Driver handover gate — only meaningful for a RESERVED unit's Confirm
+  // Pickup (the moment keys actually change hands for a loaner the mobile
+  // wizard held back). A fresh walk-in Assign from AVAILABLE is not gated
+  // here — out of scope for this pass.
   const [handoverRequirements, setHandoverRequirements] = useState<RentalHandoverRequirements>({
-    driverLicense: 'BLOCK',
-    proofOfInsurance: 'BLOCK',
+    driversLicense: 'DOCUMENT',
+    driverInsurance: 'DOCUMENT',
+    rentalAgreement: 'DOCUMENT',
   });
   const [loanDriver, setLoanDriver] = useState<RentalLoanDriverRecord | null>(null);
+  const [rentalAgreementSignatureUrl, setRentalAgreementSignatureUrl] = useState<string | null>(null);
   const [newDriverName, setNewDriverName] = useState('');
   const [newLicenseFile, setNewLicenseFile] = useState<{ fileName: string; url: string } | null>(null);
   const [newInsuranceFile, setNewInsuranceFile] = useState<{ fileName: string; url: string } | null>(
     null,
   );
+  const [newLicenseNumber, setNewLicenseNumber] = useState('');
+  const [newLicenseExpiry, setNewLicenseExpiry] = useState('');
+  const [newInsuranceCarrier, setNewInsuranceCarrier] = useState('');
+  const [newPolicyNumber, setNewPolicyNumber] = useState('');
+  const [newPolicyExpiry, setNewPolicyExpiry] = useState('');
+  const [licenseAttested, setLicenseAttested] = useState(false);
+  const [insuranceAttested, setInsuranceAttested] = useState(false);
+  const [rentalAgreementAttested, setRentalAgreementAttested] = useState(false);
   // Add-vehicle form.
   const [addOpen, setAddOpen] = useState(false);
   const [addMakeModel, setAddMakeModel] = useState('');
@@ -133,35 +145,87 @@ export default function FleetPage() {
     setNewDriverName('');
     setNewLicenseFile(null);
     setNewInsuranceFile(null);
+    setNewLicenseNumber('');
+    setNewLicenseExpiry('');
+    setNewInsuranceCarrier('');
+    setNewPolicyNumber('');
+    setNewPolicyExpiry('');
+    setLicenseAttested(false);
+    setInsuranceAttested(false);
+    setRentalAgreementAttested(false);
     setLoanDriver(null);
+    setRentalAgreementSignatureUrl(null);
     // Confirm Pickup on a RESERVED unit is the moment keys actually change
     // hands — pull whatever driver documentation the wizard already
     // captured (possibly partial, if that's why it's still RESERVED) so the
-    // rep isn't asked to start over.
+    // rep isn't asked to start over. The rental-agreement signature (if any)
+    // lives on the lead, not the loan-driver row or the vehicle — Fleet has
+    // no other visibility into it.
     if (v.currentStatus === 'RESERVED') {
       void getLatestLoanDriver(v.id, v.assignedLeadId).then((record) => setLoanDriver(record));
+      void getLeadRentalAgreementSignature(v.assignedLeadId ?? null).then((url) =>
+        setRentalAgreementSignatureUrl(url),
+      );
     }
   };
 
   // A RESERVED unit's Confirm Pickup is gated; a fresh walk-in Assign from
   // AVAILABLE is not (out of scope for this pass — see the state comment).
-  const licenseCaptured = (v: RentalVehicle) =>
-    Boolean(newLicenseFile) || Boolean(loanDriver?.licenseDocumentUrl) || v.currentStatus !== 'RESERVED';
-  const insuranceCaptured = (v: RentalVehicle) =>
-    Boolean(newInsuranceFile) || Boolean(loanDriver?.insuranceDocumentUrl) || v.currentStatus !== 'RESERVED';
+  const licenseSatisfied = (v: RentalVehicle) =>
+    v.currentStatus !== 'RESERVED' ||
+    isHandoverItemSatisfied(handoverRequirements.driversLicense, {
+      hasTypedData: newLicenseNumber.trim() !== '' && newLicenseExpiry.trim() !== '',
+      attested: licenseAttested || Boolean(loanDriver?.driversLicenseAttestedAt),
+      hasDocument: Boolean(newLicenseFile) || Boolean(loanDriver?.licenseDocumentUrl),
+    });
+  const insuranceSatisfied = (v: RentalVehicle) =>
+    v.currentStatus !== 'RESERVED' ||
+    isHandoverItemSatisfied(handoverRequirements.driverInsurance, {
+      hasTypedData: newInsuranceCarrier.trim() !== '' && newPolicyNumber.trim() !== '',
+      attested: insuranceAttested || Boolean(loanDriver?.driverInsuranceAttestedAt),
+      hasDocument: Boolean(newInsuranceFile) || Boolean(loanDriver?.insuranceDocumentUrl),
+    });
+  const rentalAgreementSatisfied = (v: RentalVehicle) =>
+    v.currentStatus !== 'RESERVED' ||
+    isHandoverItemSatisfied(handoverRequirements.rentalAgreement, {
+      hasTypedData: true,
+      attested: rentalAgreementAttested || Boolean(loanDriver?.rentalAgreementAttestedAt),
+      hasDocument: Boolean(rentalAgreementSignatureUrl),
+    });
   const handoverAllowed = (v: RentalVehicle) =>
-    (licenseCaptured(v) || handoverRequirements.driverLicense !== 'BLOCK') &&
-    (insuranceCaptured(v) || handoverRequirements.proofOfInsurance !== 'BLOCK');
+    licenseSatisfied(v) && insuranceSatisfied(v) && rentalAgreementSatisfied(v);
 
   const confirmAssign = async (v: RentalVehicle) => {
     if (v.currentStatus === 'RESERVED' && !handoverAllowed(v)) return; // belt-and-suspenders; button is also disabled
-    if (v.currentStatus === 'RESERVED' && (newLicenseFile || newInsuranceFile || newDriverName.trim())) {
+    const hasNewCapture =
+      newLicenseFile ||
+      newInsuranceFile ||
+      newDriverName.trim() ||
+      newLicenseNumber.trim() ||
+      newInsuranceCarrier.trim() ||
+      licenseAttested ||
+      insuranceAttested ||
+      rentalAgreementAttested;
+    if (v.currentStatus === 'RESERVED' && hasNewCapture) {
+      const attestedBy = assignAgent.trim() || 'Rep';
+      const nowIso = new Date().toISOString();
       await addRentalLoanDriver({
         rentalVehicleId: v.id,
         leadId: v.assignedLeadId,
         driverName: newDriverName.trim() || loanDriver?.driverName || assignCustomer.trim() || 'Unknown driver',
         licenseDocumentUrl: newLicenseFile?.url ?? loanDriver?.licenseDocumentUrl ?? null,
         insuranceDocumentUrl: newInsuranceFile?.url ?? loanDriver?.insuranceDocumentUrl ?? null,
+        licenseNumber: newLicenseNumber.trim() || null,
+        licenseExpiry: newLicenseExpiry || null,
+        insuranceCarrier: newInsuranceCarrier.trim() || null,
+        policyNumber: newPolicyNumber.trim() || null,
+        policyExpiry: newPolicyExpiry || null,
+        driversLicenseAttestedBy: licenseAttested ? attestedBy : null,
+        driversLicenseAttestedAt: licenseAttested ? nowIso : null,
+        driverInsuranceAttestedBy: insuranceAttested ? attestedBy : null,
+        driverInsuranceAttestedAt: insuranceAttested ? nowIso : null,
+        rentalAgreementAttestedBy: rentalAgreementAttested ? attestedBy : null,
+        rentalAgreementAttestedAt: rentalAgreementAttested ? nowIso : null,
       });
     }
     await assignVehicle(v.id, {
@@ -306,13 +370,30 @@ export default function FleetPage() {
                     onAssignMileage={setAssignMileage}
                     handoverRequirements={handoverRequirements}
                     loanDriver={loanDriver}
+                    rentalAgreementSignatureUrl={rentalAgreementSignatureUrl}
                     newDriverName={newDriverName}
                     newLicenseFile={newLicenseFile}
                     newInsuranceFile={newInsuranceFile}
+                    newLicenseNumber={newLicenseNumber}
+                    newLicenseExpiry={newLicenseExpiry}
+                    newInsuranceCarrier={newInsuranceCarrier}
+                    newPolicyNumber={newPolicyNumber}
+                    newPolicyExpiry={newPolicyExpiry}
+                    licenseAttested={licenseAttested}
+                    insuranceAttested={insuranceAttested}
+                    rentalAgreementAttested={rentalAgreementAttested}
                     handoverAllowed={handoverAllowed(v)}
                     onNewDriverName={setNewDriverName}
                     onNewLicenseFile={setNewLicenseFile}
                     onNewInsuranceFile={setNewInsuranceFile}
+                    onNewLicenseNumber={setNewLicenseNumber}
+                    onNewLicenseExpiry={setNewLicenseExpiry}
+                    onNewInsuranceCarrier={setNewInsuranceCarrier}
+                    onNewPolicyNumber={setNewPolicyNumber}
+                    onNewPolicyExpiry={setNewPolicyExpiry}
+                    onLicenseAttested={setLicenseAttested}
+                    onInsuranceAttested={setInsuranceAttested}
+                    onRentalAgreementAttested={setRentalAgreementAttested}
                     onStartAssign={() => startAssign(v)}
                     onCancelAssign={() => setAssigningId(null)}
                     onConfirmAssign={() => void confirmAssign(v)}
@@ -353,13 +434,30 @@ interface FleetRowProps {
   onAssignMileage: (v: string) => void;
   handoverRequirements: RentalHandoverRequirements;
   loanDriver: RentalLoanDriverRecord | null;
+  rentalAgreementSignatureUrl: string | null;
   newDriverName: string;
   newLicenseFile: { fileName: string; url: string } | null;
   newInsuranceFile: { fileName: string; url: string } | null;
+  newLicenseNumber: string;
+  newLicenseExpiry: string;
+  newInsuranceCarrier: string;
+  newPolicyNumber: string;
+  newPolicyExpiry: string;
+  licenseAttested: boolean;
+  insuranceAttested: boolean;
+  rentalAgreementAttested: boolean;
   handoverAllowed: boolean;
   onNewDriverName: (v: string) => void;
   onNewLicenseFile: (f: { fileName: string; url: string } | null) => void;
   onNewInsuranceFile: (f: { fileName: string; url: string } | null) => void;
+  onNewLicenseNumber: (v: string) => void;
+  onNewLicenseExpiry: (v: string) => void;
+  onNewInsuranceCarrier: (v: string) => void;
+  onNewPolicyNumber: (v: string) => void;
+  onNewPolicyExpiry: (v: string) => void;
+  onLicenseAttested: (v: boolean) => void;
+  onInsuranceAttested: (v: boolean) => void;
+  onRentalAgreementAttested: (v: boolean) => void;
   onStartAssign: () => void;
   onCancelAssign: () => void;
   onConfirmAssign: () => void;
@@ -380,13 +478,30 @@ function FleetRow({
   onAssignMileage,
   handoverRequirements,
   loanDriver,
+  rentalAgreementSignatureUrl,
   newDriverName,
   newLicenseFile,
   newInsuranceFile,
+  newLicenseNumber,
+  newLicenseExpiry,
+  newInsuranceCarrier,
+  newPolicyNumber,
+  newPolicyExpiry,
+  licenseAttested,
+  insuranceAttested,
+  rentalAgreementAttested,
   handoverAllowed,
   onNewDriverName,
   onNewLicenseFile,
   onNewInsuranceFile,
+  onNewLicenseNumber,
+  onNewLicenseExpiry,
+  onNewInsuranceCarrier,
+  onNewPolicyNumber,
+  onNewPolicyExpiry,
+  onLicenseAttested,
+  onInsuranceAttested,
+  onRentalAgreementAttested,
   onStartAssign,
   onCancelAssign,
   onConfirmAssign,
@@ -560,9 +675,9 @@ function FleetRow({
               </button>
             </div>
 
-            {/* Driver-document handover gate — Confirm Pickup only. The
-                keys physically change hands here; a fresh walk-in Assign
-                from AVAILABLE isn't gated in this pass. */}
+            {/* Handover gate — Confirm Pickup only. The keys physically
+                change hands here; a fresh walk-in Assign from AVAILABLE
+                isn't gated in this pass. */}
             {v.currentStatus === 'RESERVED' && (
               <div className="mt-2 space-y-2 rounded-md border border-zinc-700 bg-zinc-900/60 p-2.5">
                 <p className="font-mono text-[11px] uppercase tracking-wider text-zinc-500">
@@ -575,78 +690,170 @@ function FleetRow({
                   placeholder={loanDriver?.driverName || 'Driver full name'}
                   className="w-full rounded-md border border-zinc-700 bg-zinc-950/70 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500/60 focus:outline-none"
                 />
-                <div className="grid grid-cols-2 gap-2">
-                  <label className="block">
-                    <span className="mb-1 flex items-center gap-1 text-[10px] text-zinc-500">
+
+                {handoverRequirements.driversLicense !== 'NONE' && (
+                  <div className="space-y-1.5 border-t border-zinc-700/70 pt-2">
+                    <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-zinc-500">
                       Driver&apos;s license
-                      <span
-                        className={clsx(
-                          'rounded px-1 py-0.5 font-semibold',
-                          handoverRequirements.driverLicense === 'BLOCK'
-                            ? 'bg-red-500/15 text-red-300'
-                            : 'bg-amber-500/15 text-amber-300',
-                        )}
-                      >
-                        {handoverRequirements.driverLicense}
+                      <span className="rounded bg-zinc-700 px-1 py-0.5 font-semibold text-zinc-300">
+                        {handoverRequirements.driversLicense}
                       </span>
                     </span>
-                    {loanDriver?.licenseDocumentUrl && !newLicenseFile ? (
-                      <span className="block text-[11px] text-emerald-300">✓ Already on file</span>
+                    {handoverRequirements.driversLicense === 'DOCUMENT' ? (
+                      loanDriver?.licenseDocumentUrl && !newLicenseFile ? (
+                        <span className="block text-[11px] text-emerald-300">✓ Already on file</span>
+                      ) : (
+                        <>
+                          <input
+                            type="file"
+                            accept="image/*"
+                            onChange={(e) => {
+                              const f = e.target.files?.[0];
+                              if (f) onNewLicenseFile({ fileName: f.name, url: URL.createObjectURL(f) });
+                            }}
+                            className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
+                          />
+                          {newLicenseFile && (
+                            <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
+                              ✓ {newLicenseFile.fileName}
+                            </span>
+                          )}
+                        </>
+                      )
                     ) : (
-                      <input
-                        type="file"
-                        accept="image/*"
-                        onChange={(e) => {
-                          const f = e.target.files?.[0];
-                          if (f) onNewLicenseFile({ fileName: f.name, url: URL.createObjectURL(f) });
-                        }}
-                        className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
-                      />
+                      <>
+                        <div className="grid grid-cols-2 gap-1.5">
+                          <input
+                            value={newLicenseNumber}
+                            onChange={(e) => onNewLicenseNumber(e.target.value)}
+                            placeholder="License #"
+                            className="rounded-md border border-zinc-700 bg-zinc-950/70 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500/60 focus:outline-none"
+                          />
+                          <input
+                            type="date"
+                            value={newLicenseExpiry}
+                            onChange={(e) => onNewLicenseExpiry(e.target.value)}
+                            className="rounded-md border border-zinc-700 bg-zinc-950/70 px-2 py-1 text-xs text-zinc-100 focus:border-sky-500/60 focus:outline-none"
+                          />
+                        </div>
+                        <label className="flex items-start gap-2 text-[11px] text-zinc-300">
+                          <input
+                            type="checkbox"
+                            checked={licenseAttested || Boolean(loanDriver?.driversLicenseAttestedAt)}
+                            onChange={(e) => onLicenseAttested(e.target.checked)}
+                            className="mt-0.5"
+                          />
+                          I verified this license number and expiration date against the physical
+                          card or the driver&apos;s app.
+                        </label>
+                      </>
                     )}
-                    {newLicenseFile && (
-                      <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
-                        ✓ {newLicenseFile.fileName}
-                      </span>
-                    )}
-                  </label>
-                  <label className="block">
-                    <span className="mb-1 flex items-center gap-1 text-[10px] text-zinc-500">
+                  </div>
+                )}
+
+                {handoverRequirements.driverInsurance !== 'NONE' && (
+                  <div className="space-y-1.5 border-t border-zinc-700/70 pt-2">
+                    <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-zinc-500">
                       Proof of insurance
-                      <span
-                        className={clsx(
-                          'rounded px-1 py-0.5 font-semibold',
-                          handoverRequirements.proofOfInsurance === 'BLOCK'
-                            ? 'bg-red-500/15 text-red-300'
-                            : 'bg-amber-500/15 text-amber-300',
-                        )}
-                      >
-                        {handoverRequirements.proofOfInsurance}
+                      <span className="rounded bg-zinc-700 px-1 py-0.5 font-semibold text-zinc-300">
+                        {handoverRequirements.driverInsurance}
                       </span>
                     </span>
-                    {loanDriver?.insuranceDocumentUrl && !newInsuranceFile ? (
-                      <span className="block text-[11px] text-emerald-300">✓ Already on file</span>
+                    {handoverRequirements.driverInsurance === 'DOCUMENT' ? (
+                      loanDriver?.insuranceDocumentUrl && !newInsuranceFile ? (
+                        <span className="block text-[11px] text-emerald-300">✓ Already on file</span>
+                      ) : (
+                        <>
+                          <input
+                            type="file"
+                            accept="image/*"
+                            onChange={(e) => {
+                              const f = e.target.files?.[0];
+                              if (f) onNewInsuranceFile({ fileName: f.name, url: URL.createObjectURL(f) });
+                            }}
+                            className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
+                          />
+                          {newInsuranceFile && (
+                            <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
+                              ✓ {newInsuranceFile.fileName}
+                            </span>
+                          )}
+                        </>
+                      )
                     ) : (
-                      <input
-                        type="file"
-                        accept="image/*"
-                        onChange={(e) => {
-                          const f = e.target.files?.[0];
-                          if (f) onNewInsuranceFile({ fileName: f.name, url: URL.createObjectURL(f) });
-                        }}
-                        className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
-                      />
+                      <>
+                        <input
+                          value={newInsuranceCarrier}
+                          onChange={(e) => onNewInsuranceCarrier(e.target.value)}
+                          placeholder="Insurance carrier"
+                          className="w-full rounded-md border border-zinc-700 bg-zinc-950/70 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500/60 focus:outline-none"
+                        />
+                        <div className="grid grid-cols-2 gap-1.5">
+                          <input
+                            value={newPolicyNumber}
+                            onChange={(e) => onNewPolicyNumber(e.target.value)}
+                            placeholder="Policy #"
+                            className="rounded-md border border-zinc-700 bg-zinc-950/70 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500/60 focus:outline-none"
+                          />
+                          <input
+                            type="date"
+                            value={newPolicyExpiry}
+                            onChange={(e) => onNewPolicyExpiry(e.target.value)}
+                            className="rounded-md border border-zinc-700 bg-zinc-950/70 px-2 py-1 text-xs text-zinc-100 focus:border-sky-500/60 focus:outline-none"
+                          />
+                        </div>
+                        <label className="flex items-start gap-2 text-[11px] text-zinc-300">
+                          <input
+                            type="checkbox"
+                            checked={insuranceAttested || Boolean(loanDriver?.driverInsuranceAttestedAt)}
+                            onChange={(e) => onInsuranceAttested(e.target.checked)}
+                            className="mt-0.5"
+                          />
+                          I verified this insurance carrier and policy against the physical card or
+                          the driver&apos;s app.
+                        </label>
+                      </>
                     )}
-                    {newInsuranceFile && (
-                      <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
-                        ✓ {newInsuranceFile.fileName}
+                  </div>
+                )}
+
+                {handoverRequirements.rentalAgreement !== 'NONE' && (
+                  <div className="space-y-1.5 border-t border-zinc-700/70 pt-2">
+                    <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-zinc-500">
+                      Rental / loaner agreement
+                      <span className="rounded bg-zinc-700 px-1 py-0.5 font-semibold text-zinc-300">
+                        {handoverRequirements.rentalAgreement}
                       </span>
+                    </span>
+                    {handoverRequirements.rentalAgreement === 'DOCUMENT' ? (
+                      rentalAgreementSignatureUrl ? (
+                        <span className="block text-[11px] text-emerald-300">✓ Signed on file</span>
+                      ) : (
+                        <span className="block text-[11px] text-red-300">
+                          ✗ Missing — this must be signed during intake; it cannot be captured from
+                          Fleet.
+                        </span>
+                      )
+                    ) : (
+                      <label className="flex items-start gap-2 text-[11px] text-zinc-300">
+                        <input
+                          type="checkbox"
+                          checked={rentalAgreementAttested || Boolean(loanDriver?.rentalAgreementAttestedAt)}
+                          onChange={(e) => onRentalAgreementAttested(e.target.checked)}
+                          className="mt-0.5"
+                        />
+                        I confirm {newDriverName.trim() || loanDriver?.driverName || 'the driver'}{' '}
+                        reviewed and verbally accepted the Rental / Loaner Agreement terms — this
+                        shop does not require a written signature for it.
+                      </label>
                     )}
-                  </label>
-                </div>
+                  </div>
+                )}
+
                 {!handoverAllowed && (
                   <p className="text-[11px] text-red-300">
-                    ⚠ This shop requires the missing document(s) above before these keys can be
-                    released. Confirm is disabled until they're provided.
+                    ⚠ This shop requires the missing item(s) above before these keys can be
+                    released. Confirm is disabled until they&apos;re provided.
                   </p>
                 )}
               </div>

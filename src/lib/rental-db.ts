@@ -272,6 +272,21 @@ export interface AddRentalLoanDriverInput {
   driverName: string;
   licenseDocumentUrl?: string | null;
   insuranceDocumentUrl?: string | null;
+  // ATTESTED_DATA typed fields — a rep who verified the physical card/app
+  // can type what it says instead of photographing it. Not mutually
+  // exclusive with the document urls above; a row can carry both.
+  licenseNumber?: string | null;
+  licenseExpiry?: string | null; // ISO date (yyyy-mm-dd)
+  insuranceCarrier?: string | null;
+  policyNumber?: string | null;
+  policyExpiry?: string | null; // ISO date (yyyy-mm-dd)
+  // Attestation — who verified it and when, independently per item.
+  driversLicenseAttestedBy?: string | null;
+  driversLicenseAttestedAt?: string | null;
+  driverInsuranceAttestedBy?: string | null;
+  driverInsuranceAttestedAt?: string | null;
+  rentalAgreementAttestedBy?: string | null;
+  rentalAgreementAttestedAt?: string | null;
 }
 
 interface LocalLoanDriver extends AddRentalLoanDriverInput {}
@@ -285,6 +300,17 @@ export interface RentalLoanDriverRecord {
   driverName: string;
   licenseDocumentUrl: string | null;
   insuranceDocumentUrl: string | null;
+  licenseNumber: string | null;
+  licenseExpiry: string | null;
+  insuranceCarrier: string | null;
+  policyNumber: string | null;
+  policyExpiry: string | null;
+  driversLicenseAttestedBy: string | null;
+  driversLicenseAttestedAt: string | null;
+  driverInsuranceAttestedBy: string | null;
+  driverInsuranceAttestedAt: string | null;
+  rentalAgreementAttestedBy: string | null;
+  rentalAgreementAttestedAt: string | null;
   createdAt: string;
 }
 
@@ -295,6 +321,17 @@ interface LoanDriverRow {
   driver_name: string;
   license_document_url: string | null;
   insurance_document_url: string | null;
+  license_number: string | null;
+  license_expiry: string | null;
+  insurance_carrier: string | null;
+  policy_number: string | null;
+  policy_expiry: string | null;
+  drivers_license_attested_by: string | null;
+  drivers_license_attested_at: string | null;
+  driver_insurance_attested_by: string | null;
+  driver_insurance_attested_at: string | null;
+  rental_agreement_attested_by: string | null;
+  rental_agreement_attested_at: string | null;
   created_at: string;
 }
 
@@ -306,7 +343,41 @@ function rowToLoanDriver(row: LoanDriverRow): RentalLoanDriverRecord {
     driverName: row.driver_name,
     licenseDocumentUrl: row.license_document_url,
     insuranceDocumentUrl: row.insurance_document_url,
+    licenseNumber: row.license_number,
+    licenseExpiry: row.license_expiry,
+    insuranceCarrier: row.insurance_carrier,
+    policyNumber: row.policy_number,
+    policyExpiry: row.policy_expiry,
+    driversLicenseAttestedBy: row.drivers_license_attested_by,
+    driversLicenseAttestedAt: row.drivers_license_attested_at,
+    driverInsuranceAttestedBy: row.driver_insurance_attested_by,
+    driverInsuranceAttestedAt: row.driver_insurance_attested_at,
+    rentalAgreementAttestedBy: row.rental_agreement_attested_by,
+    rentalAgreementAttestedAt: row.rental_agreement_attested_at,
     createdAt: row.created_at,
+  };
+}
+
+function localToRecord(local: LocalLoanDriver): RentalLoanDriverRecord {
+  return {
+    id: 'local',
+    rentalVehicleId: local.rentalVehicleId,
+    leadId: local.leadId ?? null,
+    driverName: local.driverName,
+    licenseDocumentUrl: local.licenseDocumentUrl ?? null,
+    insuranceDocumentUrl: local.insuranceDocumentUrl ?? null,
+    licenseNumber: local.licenseNumber ?? null,
+    licenseExpiry: local.licenseExpiry ?? null,
+    insuranceCarrier: local.insuranceCarrier ?? null,
+    policyNumber: local.policyNumber ?? null,
+    policyExpiry: local.policyExpiry ?? null,
+    driversLicenseAttestedBy: local.driversLicenseAttestedBy ?? null,
+    driversLicenseAttestedAt: local.driversLicenseAttestedAt ?? null,
+    driverInsuranceAttestedBy: local.driverInsuranceAttestedBy ?? null,
+    driverInsuranceAttestedAt: local.driverInsuranceAttestedAt ?? null,
+    rentalAgreementAttestedBy: local.rentalAgreementAttestedBy ?? null,
+    rentalAgreementAttestedAt: local.rentalAgreementAttestedAt ?? null,
+    createdAt: new Date().toISOString(),
   };
 }
 
@@ -324,6 +395,17 @@ export async function addRentalLoanDriver(input: AddRentalLoanDriverInput): Prom
       driver_name: input.driverName,
       license_document_url: input.licenseDocumentUrl ?? null,
       insurance_document_url: input.insuranceDocumentUrl ?? null,
+      license_number: input.licenseNumber ?? null,
+      license_expiry: input.licenseExpiry ?? null,
+      insurance_carrier: input.insuranceCarrier ?? null,
+      policy_number: input.policyNumber ?? null,
+      policy_expiry: input.policyExpiry ?? null,
+      drivers_license_attested_by: input.driversLicenseAttestedBy ?? null,
+      drivers_license_attested_at: input.driversLicenseAttestedAt ?? null,
+      driver_insurance_attested_by: input.driverInsuranceAttestedBy ?? null,
+      driver_insurance_attested_at: input.driverInsuranceAttestedAt ?? null,
+      rental_agreement_attested_by: input.rentalAgreementAttestedBy ?? null,
+      rental_agreement_attested_at: input.rentalAgreementAttestedAt ?? null,
     });
     if (!error) return;
   } catch {
@@ -335,7 +417,7 @@ export async function addRentalLoanDriver(input: AddRentalLoanDriverInput): Prom
 /**
  * Reads the most recent loan-driver record for a vehicle (optionally scoped
  * to a specific lead) — e.g. what the mobile wizard captured when a loaner
- * was first reserved with a document still outstanding, so the Fleet
+ * was first reserved with a requirement still outstanding, so the Fleet
  * Command Center's confirm-pickup screen can show what's already on file
  * instead of asking the rep to start over. Returns null when nothing has
  * been captured yet — callers must treat that as "missing everything."
@@ -363,39 +445,65 @@ export async function getLatestLoanDriver(
     (d) => d.rentalVehicleId === rentalVehicleId && (!leadId || d.leadId === leadId),
   );
   const last = candidates[candidates.length - 1];
-  return last
-    ? {
-        id: 'local',
-        rentalVehicleId: last.rentalVehicleId,
-        leadId: last.leadId ?? null,
-        driverName: last.driverName,
-        licenseDocumentUrl: last.licenseDocumentUrl ?? null,
-        insuranceDocumentUrl: last.insuranceDocumentUrl ?? null,
-        createdAt: new Date().toISOString(),
-      }
-    : null;
+  return last ? localToRecord(last) : null;
+}
+
+/**
+ * Reads whether a lead's Rental / Loaner Agreement was signed on-site
+ * (intake_leads.rental_agreement_signature_url) — the DOCUMENT evidence for
+ * the rentalAgreement handover item when checked from the Fleet
+ * confirm-pickup screen, which otherwise has no visibility into a signature
+ * the mobile wizard captured against the lead, not the vehicle or the loan
+ * record. Best-effort; returns null (treated as "no document") on failure.
+ */
+export async function getLeadRentalAgreementSignature(leadId: string | null): Promise<string | null> {
+  if (!leadId) return null;
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const { data, error } = await supabase
+      .from('intake_leads')
+      .select('rental_agreement_signature_url')
+      .eq('id', leadId)
+      .maybeSingle();
+    if (!error && data) {
+      return (data as { rental_agreement_signature_url: string | null }).rental_agreement_signature_url;
+    }
+  } catch {
+    /* best-effort */
+  }
+  return null;
 }
 
 // --- per-shop handover requirements -------------------------------------------
-export type HandoverRequirementLevel = 'BLOCK' | 'WARN';
+export type HandoverLevel = 'NONE' | 'ATTESTED_DATA' | 'DOCUMENT';
 
 export interface RentalHandoverRequirements {
-  driverLicense: HandoverRequirementLevel;
-  proofOfInsurance: HandoverRequirementLevel;
+  driversLicense: HandoverLevel;
+  driverInsurance: HandoverLevel;
+  rentalAgreement: HandoverLevel;
 }
 
-// Matches the migration's own column default — a network failure or an
-// unrecognized config shape must never silently loosen the gate to WARN.
+// Matches the migration's own column default. DOCUMENT is the strictest
+// level, so it's the fail-closed default for all three whenever the org,
+// the column, or the session can't be resolved — a network failure must
+// never silently loosen the gate.
 const DEFAULT_HANDOVER_REQUIREMENTS: RentalHandoverRequirements = {
-  driverLicense: 'BLOCK',
-  proofOfInsurance: 'BLOCK',
+  driversLicense: 'DOCUMENT',
+  driverInsurance: 'DOCUMENT',
+  rentalAgreement: 'DOCUMENT',
 };
 
+const VALID_HANDOVER_LEVELS: readonly string[] = ['NONE', 'ATTESTED_DATA', 'DOCUMENT'];
+function coerceHandoverLevel(v: unknown): HandoverLevel {
+  return typeof v === 'string' && VALID_HANDOVER_LEVELS.includes(v) ? (v as HandoverLevel) : 'DOCUMENT';
+}
+
 /**
- * Reads the current session's org's driver-document handover policy — which
- * documents block key release vs merely warn. Falls back to BLOCK/BLOCK
- * (the safe default) whenever the org, the column, or the session can't be
- * resolved, rather than defaulting open.
+ * Reads the current session's org's driver-document handover policy — the
+ * NONE / ATTESTED_DATA / DOCUMENT level required per item before a loaner's
+ * keys can be released. Falls back to DOCUMENT/DOCUMENT/DOCUMENT (the safe
+ * default) whenever the org, the column, an unrecognized value, or the
+ * session can't be resolved, rather than defaulting open.
  */
 export async function getRentalHandoverRequirements(): Promise<RentalHandoverRequirements> {
   try {
@@ -412,8 +520,9 @@ export async function getRentalHandoverRequirements(): Promise<RentalHandoverReq
       if (raw && typeof raw === 'object') {
         const r = raw as Partial<Record<keyof RentalHandoverRequirements, unknown>>;
         return {
-          driverLicense: r.driverLicense === 'WARN' ? 'WARN' : 'BLOCK',
-          proofOfInsurance: r.proofOfInsurance === 'WARN' ? 'WARN' : 'BLOCK',
+          driversLicense: coerceHandoverLevel(r.driversLicense),
+          driverInsurance: coerceHandoverLevel(r.driverInsurance),
+          rentalAgreement: coerceHandoverLevel(r.rentalAgreement),
         };
       }
     }
@@ -421,6 +530,20 @@ export async function getRentalHandoverRequirements(): Promise<RentalHandoverReq
     /* fall through to the safe default */
   }
   return DEFAULT_HANDOVER_REQUIREMENTS;
+}
+
+/**
+ * True when a handover item's requirement level is satisfied. Shared by the
+ * mobile wizard and the Fleet confirm-pickup screen so the three-level
+ * logic isn't duplicated per item per caller.
+ */
+export function isHandoverItemSatisfied(
+  level: HandoverLevel,
+  opts: { hasTypedData: boolean; attested: boolean; hasDocument: boolean },
+): boolean {
+  if (level === 'NONE') return true;
+  if (level === 'ATTESTED_DATA') return opts.hasTypedData && opts.attested;
+  return opts.hasDocument; // DOCUMENT
 }
 
 /** Sets a vehicle's status directly (e.g. toggle MAINTENANCE). */

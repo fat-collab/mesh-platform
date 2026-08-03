@@ -47,6 +47,15 @@ alter table public.intake_leads
 -- app-generated text and locally-bridged/mock leads (e.g. 'mock-a6f1')
 -- would not satisfy a strict FK. Same reasoning CLAUDE.md §6 item 4 already
 -- gives for rental_vehicles.assigned_ro_id not being FK'd either.
+-- Typed fields (license number/expiry, insurance carrier/policy number/
+-- policy expiry) back the ATTESTED_DATA path for drivers_license and
+-- driver_insurance — a rep who verified the physical card/app can type what
+-- it says instead of photographing it. Attestation columns exist per item
+-- (drivers_license, driver_insurance, rental_agreement), independently: who
+-- attested and when, for each. DOCUMENT and ATTESTED_DATA are not mutually
+-- exclusive — a shop may want both, so neither set of columns replaces the
+-- other; a row can carry a document url, typed data, an attestation, any
+-- combination, or none.
 create table if not exists public.rental_loan_drivers (
   id                      uuid primary key default gen_random_uuid(),
   rental_vehicle_id       text not null references public.rental_vehicles(id) on delete cascade,
@@ -54,6 +63,17 @@ create table if not exists public.rental_loan_drivers (
   driver_name             text not null,
   license_document_url    text,
   insurance_document_url  text,
+  license_number          text,
+  license_expiry          date,
+  insurance_carrier       text,
+  policy_number           text,
+  policy_expiry           date,
+  drivers_license_attested_by   text,
+  drivers_license_attested_at   timestamptz,
+  driver_insurance_attested_by  text,
+  driver_insurance_attested_at  timestamptz,
+  rental_agreement_attested_by  text,
+  rental_agreement_attested_at  timestamptz,
   created_at              timestamptz not null default now()
 );
 
@@ -68,16 +88,33 @@ create policy rental_loan_drivers_all on public.rental_loan_drivers
   for all to authenticated, anon using (true) with check (true);
 
 -- --- 3. Per-shop handover requirements ----------------------------------------
--- Which driver documents block key release vs merely warn. Defaults to
--- BLOCK for both, deliberately — a shop that never configures this is the
--- shop most likely to hand keys to an unlicensed or uninsured driver by
--- default. "No added friction" for a non-fleet shop is still satisfied:
--- this column is never read unless a loaner is actually being issued, so a
--- shop with no fleet never hits this gate regardless of its value. A shop
--- that wants WARN-only has to set it, not fall into it.
+-- Three independent items — driversLicense, driverInsurance,
+-- rentalAgreement — each set to one of:
+--   NONE          not required at all
+--   ATTESTED_DATA typed data (see rental_loan_drivers' typed columns above)
+--                 plus the rep's explicit attestation that they verified it
+--                 against the physical card or the driver's app
+--   DOCUMENT      an uploaded image
+-- Defaults to DOCUMENT for all three, deliberately — a shop that never
+-- configures this is the shop most likely to hand keys to an unverified
+-- driver by default; "no added friction" for a non-fleet shop is still
+-- satisfied, since this column is never read unless a loaner is actually
+-- being issued. A shop has to deliberately loosen this, not fall into it.
+--
+-- Setting driverInsurance to NONE is an insurance decision, not a UI
+-- preference: it asserts that this shop's own fleet policy covers
+-- permissive drivers (i.e. the shop's insurance, not the driver's, is what
+-- protects the loaner), so requiring the driver's own proof of insurance
+-- would be pointless friction — the WARN/BLOCK boolean model this replaces
+-- couldn't express "not needed at all," only "needed, but not blocking,"
+-- which still forced reps to type junk into a required field to get past
+-- the gate on exactly this class of shop.
 alter table public.organizations
   add column if not exists rental_handover_requirements jsonb not null default
-    '{"driverLicense": "BLOCK", "proofOfInsurance": "BLOCK"}'::jsonb;
+    '{"driversLicense": "DOCUMENT", "driverInsurance": "DOCUMENT", "rentalAgreement": "DOCUMENT"}'::jsonb;
+
+comment on column public.organizations.rental_handover_requirements is
+  'Per-item loaner handover requirement level: NONE | ATTESTED_DATA | DOCUMENT, for driversLicense / driverInsurance / rentalAgreement. Setting driverInsurance to NONE asserts the shop''s own fleet policy covers permissive drivers -- an insurance decision the shop is making, not a UI preference.';
 
 -- --- 4 + 5. Backfill: flag, never move ----------------------------------------
 -- Cannot reliably identify which existing signatures were actually rental

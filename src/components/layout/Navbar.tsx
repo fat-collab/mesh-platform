@@ -61,6 +61,7 @@ export function Navbar() {
   }
   if (profile?.role === 'EXECUTIVE') {
     links.push({ href: '/dashboard/analytics', label: 'Executive Analytics' });
+    links.push({ href: '/dashboard/team', label: 'Team' });
   }
 
   async function handleLogout() {

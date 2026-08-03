@@ -72,3 +72,17 @@ Database tables must include:
    coordinated ID-generation migration.
 6. `database.types.ts` is stale. Migrations are the source of truth.
    Regenerate with: `supabase gen types typescript --project-id <ref>`
+
+## 7. Verification
+
+1. After any UI or DAL change, verify in the browser before reporting done.
+   `tsc --noEmit` passing is necessary but not sufficient — this codebase
+   silently falls back to in-memory stores on DB failure, so a change can
+   typecheck, appear to work, and persist nothing.
+2. The persistence test is: make the change, hard-refresh, confirm it
+   survived. If it reverts, the write fell through to `localLeads` or
+   `localLeadVehicles` and never reached Postgres.
+3. Report console errors explicitly, including any caught-and-logged errors,
+   not just uncaught ones. Several code paths `console.warn` and continue.
+4. State which role the test session was under. RLS is org-scoped and
+   role-gated now, so a result under EXECUTIVE does not predict SALES.

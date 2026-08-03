@@ -5,7 +5,7 @@
  * when the intake_leads table is unavailable, plus convertLeadToRO which drops
  * an approved lead onto the Ops production floor as a new INTAKE repair order.
  */
-import { getSupabaseBrowserClient } from './supabase';
+import { getSupabaseBrowserClient, type MeshSupabaseClient } from './supabase';
 import { executeDBOperation } from './db-guard';
 import { assignStaff } from './assignments-db';
 import { getCurrentProfile } from './auth';
@@ -17,6 +17,7 @@ import { getCarrierIntel, CHECKLIST_ITEM_LABEL } from '@/lib/carrier-intel';
 import type {
   DamageType,
   DispatchStatus,
+  IntakeDocKind,
   IntakeDocumentRef,
   IntakeLead,
   IntakeSubmission,
@@ -95,6 +96,7 @@ function rowToLead(row: LeadRow): IntakeLead {
     zipCode: row.zip_code ?? undefined,
     severity: row.severity ?? undefined,
     damagePhotos: row.damage_photos ?? undefined,
+    documents: Array.isArray(row.documents) ? (row.documents as unknown as IntakeDocumentRef[]) : undefined,
     routingPath: row.routing_path ?? undefined,
     dispatchStaffName: row.dispatch_staff_name ?? undefined,
     dispatchStatus: row.dispatch_status ?? undefined,
@@ -452,6 +454,7 @@ export async function saveIntakePackage(submission: IntakeSubmission): Promise<I
     policyholderMatch,
     proxyPolicyholder: policyholderMatch ? undefined : submission.proxyPolicyholder ?? undefined,
     remoteAobStatus: policyholderMatch ? undefined : 'NOT_SENT',
+    documents: submission.documents,
   };
 
   try {
@@ -563,6 +566,7 @@ export async function createDigitalLead(input: DigitalLeadInput): Promise<Intake
     policyholderMatch: input.policyholderMatch,
     proxyPolicyholder: input.policyholderMatch ? undefined : input.proxyPolicyholder ?? undefined,
     remoteAobStatus: input.policyholderMatch ? undefined : 'NOT_SENT',
+    documents: input.documents,
   };
 
   try {
@@ -643,6 +647,7 @@ export async function createQuickLead(input: QuickLeadInput): Promise<IntakeLead
     channel: 'FIELD_DISPATCH',
     address: input.address?.trim() || undefined,
     damageType: input.damageType,
+    documents: [],
   };
 
   try {
@@ -734,6 +739,158 @@ export async function assignLeadStaff(
     lead.assignedStaffName = name ?? undefined;
     lead.assignedStaffId = staffId ?? undefined;
   }
+}
+
+/** Fields the Lead Detail Drawer may correct after intake. Partial by
+ *  design — omitted keys are left untouched, never overwritten. Deliberately
+ *  has no organizationId/id/status/createdAt: those are not patchable
+ *  through this function at all. */
+export interface LeadDetailsPatch {
+  customerName?: string;
+  phone?: string;
+  email?: string;
+  address?: string;
+  vehicleYear?: number;
+  vehicleMake?: string;
+  vehicleModel?: string;
+  vinLast8?: string;
+  insuranceCarrier?: string;
+  claimNumber?: string;
+  damageType?: DamageType;
+  estimatedAmount?: number;
+}
+
+/**
+ * Corrects a saved lead's details after intake — the fields a rep gets
+ * wrong at the door and fixes later, not status/ownership/routing (those
+ * have their own functions). Same shape as assignLeadStaff: browser client,
+ * .update({...}), .eq('id', id), .select('id'), fall through to the
+ * localLeads mirror on failure. Only keys present in `patch` are written;
+ * an empty patch is a no-op rather than an empty UPDATE.
+ */
+export async function updateLeadDetails(id: string, patch: LeadDetailsPatch): Promise<void> {
+  const dbPatch: Record<string, unknown> = {};
+  if (patch.customerName !== undefined) dbPatch.customer_name = patch.customerName;
+  if (patch.phone !== undefined) dbPatch.phone = patch.phone;
+  if (patch.email !== undefined) dbPatch.email = patch.email;
+  if (patch.address !== undefined) dbPatch.address = patch.address;
+  if (patch.vehicleYear !== undefined) dbPatch.vehicle_year = patch.vehicleYear;
+  if (patch.vehicleMake !== undefined) dbPatch.vehicle_make = patch.vehicleMake;
+  if (patch.vehicleModel !== undefined) dbPatch.vehicle_model = patch.vehicleModel;
+  if (patch.vinLast8 !== undefined) dbPatch.vin_last8 = patch.vinLast8;
+  if (patch.insuranceCarrier !== undefined) dbPatch.insurance_carrier = patch.insuranceCarrier;
+  if (patch.claimNumber !== undefined) dbPatch.claim_number = patch.claimNumber;
+  if (patch.damageType !== undefined) dbPatch.damage_type = patch.damageType;
+  if (patch.estimatedAmount !== undefined) dbPatch.estimated_amount = patch.estimatedAmount;
+  if (Object.keys(dbPatch).length === 0) return;
+
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const { data, error } = await supabase
+      .from(LEADS_TABLE)
+      .update(dbPatch)
+      .eq('id', id)
+      .select('id');
+    if (!error && data && data.length > 0) {
+      applyLeadDetailsPatchLocally(id, patch);
+      return;
+    }
+  } catch {
+    /* fall through to local */
+  }
+  applyLeadDetailsPatchLocally(id, patch);
+}
+
+function applyLeadDetailsPatchLocally(id: string, patch: LeadDetailsPatch): void {
+  ensureSeed();
+  const lead = localLeads.find((l) => l.id === id);
+  if (!lead) return;
+  if (patch.customerName !== undefined) lead.customerName = patch.customerName;
+  if (patch.phone !== undefined) lead.phone = patch.phone;
+  if (patch.email !== undefined) lead.email = patch.email;
+  if (patch.address !== undefined) lead.address = patch.address;
+  if (patch.vehicleYear !== undefined) lead.vehicleYear = patch.vehicleYear;
+  if (patch.vehicleMake !== undefined) lead.vehicleMake = patch.vehicleMake;
+  if (patch.vehicleModel !== undefined) lead.vehicleModel = patch.vehicleModel;
+  if (patch.vinLast8 !== undefined) lead.vinLast8 = patch.vinLast8;
+  if (patch.insuranceCarrier !== undefined) lead.insuranceCarrier = patch.insuranceCarrier;
+  if (patch.claimNumber !== undefined) lead.claimNumber = patch.claimNumber;
+  if (patch.damageType !== undefined) lead.damageType = patch.damageType;
+  if (patch.estimatedAmount !== undefined) lead.estimatedAmount = patch.estimatedAmount;
+}
+
+async function getLeadDocuments(leadId: string): Promise<IntakeDocumentRef[]> {
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const { data, error } = await supabase
+      .from(LEADS_TABLE)
+      .select('documents')
+      .eq('id', leadId)
+      .maybeSingle();
+    if (!error && data) {
+      const docs = (data as { documents: unknown }).documents;
+      if (Array.isArray(docs)) return docs as IntakeDocumentRef[];
+    }
+  } catch {
+    /* fall through to local */
+  }
+  ensureSeed();
+  const lead = localLeads.find((l) => l.id === leadId);
+  return lead?.documents ? [...lead.documents] : [];
+}
+
+async function writeLeadDocuments(leadId: string, docs: IntakeDocumentRef[]): Promise<void> {
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const { data, error } = await supabase
+      .from(LEADS_TABLE)
+      .update({ documents: docs })
+      .eq('id', leadId)
+      .select('id');
+    if (!error && data && data.length > 0) {
+      const lead = localLeads.find((l) => l.id === leadId);
+      if (lead) lead.documents = docs;
+      return;
+    }
+  } catch {
+    /* fall through to local-only */
+  }
+  ensureSeed();
+  const lead = localLeads.find((l) => l.id === leadId);
+  if (lead) lead.documents = docs;
+}
+
+/**
+ * Appends a captured document to a lead's document vault — read-modify-write
+ * against intake_leads.documents, preserving whatever was already there.
+ * Does not dedupe by kind: replacing a wrong upload is an explicit two-step
+ * action (removeLeadDocument then addLeadDocument), not an implicit upsert.
+ * Returns the full updated document list so the caller can update its view
+ * without a separate refetch.
+ */
+export async function addLeadDocument(
+  leadId: string,
+  doc: IntakeDocumentRef,
+): Promise<IntakeDocumentRef[]> {
+  const current = await getLeadDocuments(leadId);
+  const next = [...current, doc];
+  await writeLeadDocuments(leadId, next);
+  return next;
+}
+
+/**
+ * Removes every document of the given kind from a lead's document vault —
+ * the first half of "replace a wrong upload" (call addLeadDocument after to
+ * add the corrected one). Returns the full updated document list.
+ */
+export async function removeLeadDocument(
+  leadId: string,
+  kind: IntakeDocKind,
+): Promise<IntakeDocumentRef[]> {
+  const current = await getLeadDocuments(leadId);
+  const next = current.filter((d) => d.kind !== kind);
+  await writeLeadDocuments(leadId, next);
+  return next;
 }
 
 /**
@@ -839,9 +996,14 @@ export async function markRemoteAobDispatched(leadId: string, token: string): Pr
  * written into an organization the caller didn't belong to (cross-tenant
  * write, confirmed in live data). Callers must handle the throw; do not
  * reintroduce a fallback that swallows it.
+ *
+ * Accepts an optional client so a server caller (a Route Handler, which has
+ * no browser cookies) can pass a session-bearing client instead of silently
+ * getting getSupabaseBrowserClient()'s default — see convertLeadToRO below
+ * for why that default is wrong outside an actual browser.
  */
-async function resolveOrganizationId(): Promise<string> {
-  const profile = await getCurrentProfile(getSupabaseBrowserClient());
+async function resolveOrganizationId(client?: MeshSupabaseClient): Promise<string> {
+  const profile = await getCurrentProfile(client ?? getSupabaseBrowserClient());
   if (profile?.organizationId) return profile.organizationId;
   throw new Error('Cannot resolve organization for the current session');
 }
@@ -853,10 +1015,20 @@ async function resolveOrganizationId(): Promise<string> {
  * on any DB error, a missing org, or an unmigrated table it falls back to the
  * shared local Ops-board bridge so the RO is still visible on the floor.
  * Idempotent per lead.
+ *
+ * `client` defaults to getSupabaseBrowserClient() — correct for every
+ * existing browser-side caller. A server caller (e.g. convert/route.ts,
+ * which has no browser cookies for that client to read) MUST pass its own
+ * session-bearing client explicitly, or every query below runs as an
+ * unauthenticated anon/no-session client: RLS then silently returns zero
+ * rows for a lead that genuinely exists — not an error, just "not found"
+ * (confirmed live: a real row with organization_id 021a9386-... came back
+ * empty under the default browser client called server-side).
  */
 export async function convertLeadToRO(
   leadId: string,
   organizationId?: string,
+  client?: MeshSupabaseClient,
 ): Promise<string> {
   ensureSeed();
   const cached = leadRoMap.get(leadId);
@@ -864,26 +1036,32 @@ export async function convertLeadToRO(
 
   // If no org id was passed, resolve from the current session, falling back
   // to the first DB org (dev fallback) — see resolveOrganizationId().
-  const activeOrgId = organizationId || (await resolveOrganizationId());
+  const activeOrgId = organizationId || (await resolveOrganizationId(client));
 
   const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-  // Prefix normalization: locally-generated lead ids carry a 'lead-' prefix
-  // (genId('lead')) that isn't part of the underlying UUID once one exists —
-  // strip it before matching/querying so a DB-backed lead can still be found
-  // even when the caller's reference carries the local-only prefix.
-  const normalizedLeadId = leadId.startsWith('lead-') ? leadId.slice('lead-'.length) : leadId;
+  // genId('lead') produces 'lead-<uuid>', and intake_leads.id stores that
+  // FULL prefixed string verbatim — confirmed against live data, including
+  // for app-created leads, not just seed rows like 'lead-1005'. The prefix
+  // is real, stored data, never stripped before insert. leadIdSuffix exists
+  // ONLY to test whether this id's suffix (after discounting the prefix) is
+  // itself a real generated UUID — that's how we tell an app-created lead
+  // ('lead-1d970b31-...') apart from a seed-style short id ('lead-1005').
+  // It must NEVER be used to query the database — leadId (prefix intact) is
+  // what's actually stored and must be queried against.
+  const leadIdSuffix = leadId.startsWith('lead-') ? leadId.slice('lead-'.length) : leadId;
 
-  // 3. If an organization was secured and the normalized ID is a valid
-  // database UUID, attempt the true multi-step DB flow.
-  if (activeOrgId && UUID_REGEX.test(normalizedLeadId)) {
+  // 3. If an organization was secured and the id's suffix is a valid
+  // database UUID (i.e. this is an app-created lead, not a seed-style
+  // short id), attempt the true multi-step DB flow.
+  if (activeOrgId && UUID_REGEX.test(leadIdSuffix)) {
     try {
-      const supabase = getSupabaseBrowserClient();
+      const supabase = client ?? getSupabaseBrowserClient();
 
       const { data, error: leadError } = await supabase
         .from(LEADS_TABLE)
         .select('*')
-        .eq('id', normalizedLeadId)
+        .eq('id', leadId)
         .maybeSingle();
       if (leadError) throw new Error(`Failed to fetch lead: ${leadError.message}`);
 
@@ -899,7 +1077,17 @@ export async function convertLeadToRO(
       // reconstructed through this branch will therefore always show every
       // carrier-checklist item as missing under the gate a few lines down,
       // regardless of what was actually captured. Known gap, not fixed here.
-      if (!lead) {
+      //
+      // Only for browser callers (no explicit client). localLeads is
+      // module-scope state private to whichever JS runtime is executing —
+      // a server caller's copy only ever holds the 8 hardcoded MOCK_LEADS,
+      // never anything a real user created in their own browser tab, so
+      // this branch could never legitimately succeed there. Worse, letting
+      // it "succeed" from mock data would have an API route report
+      // { success: true, roId } for a lead it never actually found — a
+      // fabricated success is worse than a clear 400. A server caller
+      // (client passed) skips straight to the throw below instead.
+      if (!lead && !client) {
         ensureSeed();
         const cached = localLeads.find((l) => l.id === leadId);
         if (!cached) throw new Error(`Lead ${leadId} not found in DB or local cache.`);
@@ -917,6 +1105,9 @@ export async function convertLeadToRO(
           created_at: cached.intakeDate,
         };
       }
+      // Server caller, zero DB rows: propagate a clear "not found" instead
+      // of dereferencing a null lead a few lines down.
+      if (!lead) throw new Error(`Lead ${leadId} not found`);
 
       // Carrier-checklist gate — moved here from MobileIntakeWizard's step-2
       // canProceed(), which used to block the LEAD from being saved at all.
@@ -976,7 +1167,7 @@ export async function convertLeadToRO(
       const { error: updateError } = await supabase
         .from(LEADS_TABLE)
         .update({ status: 'CONVERTED' })
-        .eq('id', normalizedLeadId);
+        .eq('id', leadId);
       if (updateError) {
         console.warn(`[sales-db] lead status archive failed for ${leadId}:`, updateError.message);
       }
@@ -1004,8 +1195,13 @@ export async function convertLeadToRO(
     } catch (err) {
       // The checklist gate above is a business-rule stop, not an
       // infrastructure failure — it must reach the caller, not degrade
-      // into a silently-provisioned RO via the local bridge below.
-      if (err instanceof CarrierChecklistIncompleteError) throw err;
+      // into a silently-provisioned RO via the local bridge below. Same
+      // for ANY error when a server client was supplied: the local bridge
+      // below matches against localLeads, which for a seed-style id
+      // (e.g. 'lead-1005') would still fabricate a "success" even for a
+      // server caller — the client check has to gate the whole fallback,
+      // not just the not-found branch above.
+      if (err instanceof CarrierChecklistIncompleteError || client) throw err;
       console.error('True DB conversion failed, falling back to local bridge:', err);
       /* falls through to the local sandbox bridge below */
     }

@@ -48,6 +48,11 @@ export interface IntakeLead {
   severity?: StormSeverity;
   /** Damage photos captured at digital intake. */
   damagePhotos?: IntakeDocumentRef[];
+  /** Full document vault (DL front/back, insurance card, carrier-required
+   *  checklist items, etc.) — mirrors intake_leads.documents. Distinct from
+   *  damagePhotos above (a narrower digital-intake-only subset). Lazily
+   *  populated; not every lead list fetch attaches this. */
+  documents?: IntakeDocumentRef[];
   /** Post-contact dual-path routing decision. */
   routingPath?: RoutingPath;
   /** Field agent assigned when routingPath is MOBILE_HOUSE_CALL. */

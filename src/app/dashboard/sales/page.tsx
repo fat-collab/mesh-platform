@@ -39,6 +39,7 @@ import { QuickLeadModal } from '@/components/sales/QuickLeadModal';
 import { DigitalIntakeQuickAdd } from '@/components/sales/DigitalIntakeQuickAdd';
 import { LeadActionCard } from '@/components/sales/LeadActionCard';
 import { LeadOwnerChip } from '@/components/sales/LeadOwnerChip';
+import { LeadDetailDrawer } from '@/components/sales/LeadDetailDrawer';
 import { RoutingActionPanel } from '@/components/sales/RoutingActionPanel';
 import { CommissionPanel } from '@/components/sales/CommissionPanel';
 
@@ -145,11 +146,13 @@ function LeadCard({
   stageByClaim,
   onMove,
   onRefetch,
+  onOpenDetail,
 }: {
   lead: IntakeLead;
   stageByClaim: Map<string, RoStage>;
   onMove: (id: string, status: LeadStatus) => void;
   onRefetch: () => void;
+  onOpenDetail: (lead: IntakeLead) => void;
 }) {
   const productionStage = lead.status === 'CONVERTED' ? stageByClaim.get(lead.claimNumber) : undefined;
   const productionMeta = productionStage ? STAGE_META[productionStage] : null;
@@ -165,7 +168,14 @@ function LeadCard({
   return (
     <div className="rounded-lg border border-zinc-700/70 bg-zinc-800/80 p-3 text-left shadow-sm transition-colors duration-200">
       <div className="flex items-start justify-between gap-2">
-        <p className="truncate text-sm font-semibold text-zinc-100">{lead.customerName}</p>
+        <button
+          type="button"
+          onClick={() => onOpenDetail(lead)}
+          title="Open lead details"
+          className="truncate text-left text-sm font-semibold text-zinc-100 hover:text-sky-300 hover:underline"
+        >
+          {lead.customerName}
+        </button>
         <span className="shrink-0 text-xs font-semibold tabular-nums text-emerald-300">
           {money(lead.estimatedAmount)}
         </span>
@@ -292,6 +302,7 @@ function LeadCard({
 
 export default function SalesIntakePage() {
   const [leads, setLeads] = useState<IntakeLead[]>([]);
+  const [detailLead, setDetailLead] = useState<IntakeLead | null>(null);
   const [stageByClaim, setStageByClaim] = useState<Map<string, RoStage>>(new Map());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -523,6 +534,7 @@ export default function SalesIntakePage() {
                           stageByClaim={stageByClaim}
                           onMove={moveLead}
                           onRefetch={() => void refetch()}
+                          onOpenDetail={setDetailLead}
                         />
                       ))}
 
@@ -559,6 +571,7 @@ export default function SalesIntakePage() {
                           stageByClaim={stageByClaim}
                           onMove={moveLead}
                           onRefetch={() => void refetch()}
+                          onOpenDetail={setDetailLead}
                         />
                       </div>
                     ))
@@ -607,6 +620,18 @@ export default function SalesIntakePage() {
                 ? `Digital lead captured for ${lead.customerName} — Remote AOB link sent to the proxy policyholder.`
                 : `Digital lead captured for ${lead.customerName}.`,
             );
+          }}
+        />
+      )}
+
+      {detailLead && (
+        <LeadDetailDrawer
+          lead={detailLead}
+          onClose={() => setDetailLead(null)}
+          onSaved={(updated) => {
+            setLeads((prev) => prev.map((l) => (l.id === updated.id ? updated : l)));
+            setDetailLead(null);
+            setNotice(`Saved details for ${updated.customerName}.`);
           }}
         />
       )}

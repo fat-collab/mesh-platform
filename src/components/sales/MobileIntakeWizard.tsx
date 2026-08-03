@@ -14,7 +14,14 @@ import { clsx } from 'clsx';
 import { parseEstimate } from '@/lib/estimate-parser';
 import { saveIntakePackage } from '@/lib/sales-db';
 import { importEstimateLineItems } from '@/lib/ops-db';
-import { assignVehicle, getAvailableVehicles } from '@/lib/rental-db';
+import {
+  assignVehicle,
+  reserveVehicle,
+  addRentalLoanDriver,
+  getAvailableVehicles,
+  getRentalHandoverRequirements,
+  type RentalHandoverRequirements,
+} from '@/lib/rental-db';
 import { getCurrentProfile } from '@/lib/auth';
 import { getSupabaseBrowserClient } from '@/lib/supabase';
 import { CarrierTierBadge } from '@/components/carrier/CarrierTierBadge';
@@ -86,7 +93,10 @@ const TOTAL_STEPS = STEP_TITLES.length;
 
 export interface MobileIntakeWizardProps {
   onClose: () => void;
-  onComplete: (lead: IntakeLead) => void;
+  /** holdMessage is set when a loaner was held RESERVED instead of released
+   *  because a required driver document was missing — the intake still
+   *  completed; only the vehicle handoff was deferred. */
+  onComplete: (lead: IntakeLead, holdMessage?: string) => void;
 }
 
 export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardProps) {
@@ -151,16 +161,50 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
   const [loanerPreDamage, setLoanerPreDamage] = useState('');
   const [expectedReturnDate, setExpectedReturnDate] = useState('');
   const [loanerAgent, setLoanerAgent] = useState('');
+  // Loaner driver — may differ from the AOB signer (Named Insured or proxy).
+  // Not auto-filled from rentalOperator: a legal handover record should be a
+  // deliberate entry, not a silent assumption.
+  const [driverName, setDriverName] = useState('');
+  const [driverLicenseFile, setDriverLicenseFile] = useState<IntakeDocumentRef | null>(null);
+  const [driverInsuranceFile, setDriverInsuranceFile] = useState<IntakeDocumentRef | null>(null);
+  const [handoverRequirements, setHandoverRequirements] = useState<RentalHandoverRequirements>({
+    driverLicense: 'BLOCK',
+    proofOfInsurance: 'BLOCK',
+  });
 
-  // Step 5 — agreement + signature
+  // Step 5 — repair AOB signature (Named Insured on-site only; deferred to
+  // the Remote AOB Execution Gate otherwise).
   const [signatureDataUrl, setSignatureDataUrl] = useState<string | null>(null);
   const [agreed, setAgreed] = useState(false);
+  // Rental / Loaner Agreement signature — a legally separate document from
+  // the AOB above. Needed whenever a loaner is issued at all, independent
+  // of policyholderMatch: a loaner to the Named Insured previously shared
+  // the AOB's signature pad with no distinct record of its own; a loaner to
+  // a proxy previously required this signature only when the proxy was
+  // literally the one taking custody (rentalOperator.source === 'PROXY'),
+  // silently skipping it otherwise. Both were gaps — this now applies
+  // uniformly to any loaner, regardless of who's driving.
+  const [rentalSignatureDataUrl, setRentalSignatureDataUrl] = useState<string | null>(null);
+  const [rentalAgreed, setRentalAgreed] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       const units = await getAvailableVehicles();
       if (!cancelled) setAvailableFleet(units);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Cheap, unconditional read (mirrors getAvailableVehicles above) — a shop
+  // with no fleet just never reaches the step where this value matters.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const requirements = await getRentalHandoverRequirements();
+      if (!cancelled) setHandoverRequirements(requirements);
     })();
     return () => {
       cancelled = true;
@@ -212,11 +256,20 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
     documents: docs,
   });
 
-  // A proxy who isn't the Named Insured still takes physical custody of a
-  // loaner, so the Rental Fleet Agreement (bound to them, above) needs an
-  // on-site signature even though the main repair AOB defers to the Remote
-  // AOB Execution Gate.
-  const requiresOnSiteSignature = policyholderMatch || (provideLoaner && rentalOperator.source === 'PROXY');
+  // The AOB is signed on-site only when the Named Insured is present;
+  // otherwise it defers entirely to the Remote AOB Execution Gate.
+  const requiresAobSignature = policyholderMatch;
+  // The Rental / Loaner Agreement is its own document, needed whenever a
+  // loaner is issued at all — regardless of who's driving. Previously this
+  // only fired for a proxy taking custody (rentalOperator.source ===
+  // 'PROXY'); a loaner issued to the Named Insured needs exactly the same
+  // signature and previously got none of its own.
+  const requiresRentalSignature = provideLoaner;
+
+  const handoverAllowed =
+    !provideLoaner ||
+    ((driverLicenseFile !== null || handoverRequirements.driverLicense !== 'BLOCK') &&
+      (driverInsuranceFile !== null || handoverRequirements.proofOfInsurance !== 'BLOCK'));
 
   const setDoc = (kind: IntakeDocKind, file: File | undefined) => {
     if (!file) return;
@@ -316,8 +369,17 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
     // provisioning (see convertLeadToRO), where a missing item blocks
     // opening the repair order instead of blocking the lead from being
     // saved. See the persistent warning rendered in the Step 2 UI below.
+    // Vehicle selection is required to advance; the driver-document BLOCK
+    // gate is enforced separately (handoverAllowed, checked on the final
+    // submit button) rather than here, so a rep can still fill in the rest
+    // of the intake while documents are outstanding — only the actual
+    // key-handover action is what BLOCK is meant to stop.
     if (step === 4) return !provideLoaner || selectedVehicleId !== null;
-    if (step === 5) return !requiresOnSiteSignature || (signatureDataUrl !== null && agreed);
+    if (step === 5) {
+      const aobOk = !requiresAobSignature || (signatureDataUrl !== null && agreed);
+      const rentalOk = !requiresRentalSignature || (rentalSignatureDataUrl !== null && rentalAgreed);
+      return aobOk && rentalOk;
+    }
     return true;
   };
 
@@ -341,6 +403,10 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
       }));
 
       const selectedVehicle = availableFleet.find((v) => v.id === selectedVehicleId);
+      // Falls back to the rental operator's name rather than blocking: the
+      // DB column is NOT NULL, but field-first means an empty driver-name
+      // input must never stop the rest of the intake from saving. Only the
+      // document BLOCK gate (handoverAllowed) is allowed to actually block.
       const rental: RentalAssignmentInfo | null =
         provideLoaner && selectedVehicle
           ? {
@@ -351,6 +417,9 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
               fuelLevel: parseInt(loanerFuel, 10) || selectedVehicle.fuelLevel,
               preDamageNotes: loanerPreDamage.trim(),
               expectedReturnDate,
+              driverName: driverName.trim() || rentalOperator.name || 'Unknown driver',
+              driverLicenseDocUrl: driverLicenseFile?.url ?? null,
+              driverInsuranceDocUrl: driverInsuranceFile?.url ?? null,
             }
           : null;
 
@@ -384,9 +453,9 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
         rental,
         // Remote path: no on-site signature is collected for the main repair
         // AOB — the policyholder signs later via the Remote AOB Execution
-        // Gate. A proxy taking custody of a loaner still signs the Rental
-        // Fleet Agreement on-site (requiresOnSiteSignature covers both cases).
-        signatureDataUrl: requiresOnSiteSignature ? signatureDataUrl ?? '' : '',
+        // Gate. Two independent signatures now, not one shared column.
+        signatureDataUrl: requiresAobSignature ? signatureDataUrl ?? '' : '',
+        rentalAgreementSignatureDataUrl: requiresRentalSignature ? rentalSignatureDataUrl ?? '' : '',
         agreementAcceptedAt: new Date().toISOString(),
         policyholderMatch,
         proxyPolicyholder,
@@ -403,16 +472,39 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
         }
       }
 
-      // Dual-agreement: assign the loaner against the new lead so the office
-      // fleet dashboard reflects it as RENTED.
+      // Dual-agreement: assign the loaner against the new lead. Field-first —
+      // a missing BLOCK-required driver document must never cost the rep
+      // the intake. When handoverAllowed, this is a full checkout (RENTED,
+      // real mileage/fuel). When it's not, the vehicle is held RESERVED
+      // instead — the existing two-phase state (reserveVehicle, already
+      // used by the routing panel's own hold flow) rather than fabricating
+      // a checkout with a document requirement unmet. Either way, the
+      // driver info actually captured is recorded so nothing has to be
+      // re-entered once the missing document arrives.
+      let loanerHoldMessage: string | undefined;
       if (rental) {
-        await assignVehicle(rental.vehicleId, {
+        if (handoverAllowed) {
+          await assignVehicle(rental.vehicleId, {
+            leadId: lead.id,
+            customerName: submission.customerName,
+            agentName: loanerAgent.trim() || null,
+            startingMileage: rental.startingMileage,
+            fuelLevel: rental.fuelLevel,
+            expectedReturnDate: rental.expectedReturnDate || null,
+          });
+        } else {
+          await reserveVehicle(rental.vehicleId, lead.id, submission.customerName);
+          loanerHoldMessage = `Keys for ${rental.makeModel} are HELD (not released) — missing required driver document(s). Complete them in Fleet to release.`;
+        }
+        // Records who actually took the keys — may differ from the AOB
+        // signer above. Best-effort internally (see rental-db.ts); never
+        // throws, so it can't block the rest of submit.
+        await addRentalLoanDriver({
+          rentalVehicleId: rental.vehicleId,
           leadId: lead.id,
-          customerName: submission.customerName,
-          agentName: loanerAgent.trim() || null,
-          startingMileage: rental.startingMileage,
-          fuelLevel: rental.fuelLevel,
-          expectedReturnDate: rental.expectedReturnDate || null,
+          driverName: rental.driverName,
+          licenseDocumentUrl: rental.driverLicenseDocUrl,
+          insuranceDocumentUrl: rental.driverInsuranceDocUrl,
         });
       }
 
@@ -436,7 +528,7 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
         }
       }
 
-      onComplete(finalLead);
+      onComplete(finalLead, loanerHoldMessage);
     } catch (err) {
       const detail = err instanceof Error ? err.message : 'Unknown error.';
       setScanMsg(`⚠ Intake did not complete (${detail}). Please retry.`);
@@ -925,6 +1017,100 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                         value={loanerPreDamage}
                         onChange={(e) => setLoanerPreDamage(e.target.value)}
                       />
+
+                      <div className="space-y-2 rounded-md border border-zinc-700 bg-zinc-800/40 p-2.5">
+                        <p className="font-mono text-[11px] uppercase tracking-wider text-zinc-500">
+                          Driver taking the keys{' '}
+                          <span className="normal-case text-zinc-600">
+                            (may differ from the AOB signer)
+                          </span>
+                        </p>
+                        <input
+                          className={input}
+                          placeholder={rentalOperator.name || 'Driver full name'}
+                          value={driverName}
+                          onChange={(e) => setDriverName(e.target.value)}
+                        />
+                        <div className="grid grid-cols-2 gap-2">
+                          <label className="block">
+                            <span className="mb-1 flex items-center gap-1 text-[10px] text-zinc-500">
+                              Driver&apos;s license
+                              <span
+                                className={clsx(
+                                  'rounded px-1 py-0.5 font-semibold',
+                                  handoverRequirements.driverLicense === 'BLOCK'
+                                    ? 'bg-red-500/15 text-red-300'
+                                    : 'bg-amber-500/15 text-amber-300',
+                                )}
+                              >
+                                {handoverRequirements.driverLicense}
+                              </span>
+                            </span>
+                            <input
+                              type="file"
+                              accept="image/*"
+                              onChange={(e) => {
+                                const f = e.target.files?.[0];
+                                if (f) {
+                                  setDriverLicenseFile({
+                                    kind: 'DL_FRONT',
+                                    fileName: f.name,
+                                    url: URL.createObjectURL(f),
+                                  });
+                                }
+                              }}
+                              className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
+                            />
+                            {driverLicenseFile && (
+                              <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
+                                ✓ {driverLicenseFile.fileName}
+                              </span>
+                            )}
+                          </label>
+                          <label className="block">
+                            <span className="mb-1 flex items-center gap-1 text-[10px] text-zinc-500">
+                              Proof of insurance
+                              <span
+                                className={clsx(
+                                  'rounded px-1 py-0.5 font-semibold',
+                                  handoverRequirements.proofOfInsurance === 'BLOCK'
+                                    ? 'bg-red-500/15 text-red-300'
+                                    : 'bg-amber-500/15 text-amber-300',
+                                )}
+                              >
+                                {handoverRequirements.proofOfInsurance}
+                              </span>
+                            </span>
+                            <input
+                              type="file"
+                              accept="image/*"
+                              onChange={(e) => {
+                                const f = e.target.files?.[0];
+                                if (f) {
+                                  setDriverInsuranceFile({
+                                    kind: 'INSURANCE_CARD',
+                                    fileName: f.name,
+                                    url: URL.createObjectURL(f),
+                                  });
+                                }
+                              }}
+                              className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
+                            />
+                            {driverInsuranceFile && (
+                              <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
+                                ✓ {driverInsuranceFile.fileName}
+                              </span>
+                            )}
+                          </label>
+                        </div>
+                        {!handoverAllowed && (
+                          <p className="text-[11px] text-amber-300">
+                            ⚠ This shop requires the missing document(s) above before the keys can
+                            be released. The intake will still save and the vehicle will be held
+                            RESERVED — nothing here blocks submitting.
+                          </p>
+                        )}
+                      </div>
                     </>
                   )}
                 </>
@@ -937,49 +1123,19 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
           )}
 
           {step === 5 && !policyholderMatch && (
-            <>
-              <div className="space-y-2 rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-100">
-                <p className="font-semibold text-amber-200">Remote AOB Execution Gate</p>
-                <p>
-                  {proxyFullName || 'The proxy'} isn&apos;t the Named Insured, so no on-site signature
-                  is collected here. Submitting this intake will email
-                  {proxyEmail ? ` ${proxyEmail}` : ' the proxy'} a Remote AOB Secure Signing Link to
-                  review and sign the same agreement off-site.
-                </p>
-                <p className="text-amber-300/80">
-                  The lead stays at NEW until the proxy signs remotely, which then locks it to AOB
-                  Signed automatically.
-                </p>
-              </div>
-
-              {provideLoaner && (
-                <>
-                  <RentalAgreementText operator={rentalOperator} />
-                  <p className="text-[11px] text-amber-200">
-                    {rentalOperator.name || 'The on-site proxy'} is taking custody of the loaner
-                    today, so the Rental Fleet Agreement above is signed on-site now — separate
-                    from the main repair AOB, which the policyholder signs remotely.
-                  </p>
-                  <label className="flex items-start gap-2 text-xs text-zinc-300">
-                    <input
-                      type="checkbox"
-                      checked={agreed}
-                      onChange={(e) => setAgreed(e.target.checked)}
-                      className="mt-0.5"
-                    />
-                    I have read and accept the Rental / Loaner Agreement on behalf of{' '}
-                    {rentalOperator.name || 'the on-site driver'}, and authorize release of the
-                    vehicle.
-                  </label>
-                  <div>
-                    <p className="mb-1 font-mono text-[11px] uppercase tracking-wider text-zinc-500">
-                      {rentalOperator.name || 'Driver'} signature (Rental Agreement)
-                    </p>
-                    <SignaturePad onChange={setSignatureDataUrl} />
-                  </div>
-                </>
-              )}
-            </>
+            <div className="space-y-2 rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-100">
+              <p className="font-semibold text-amber-200">Remote AOB Execution Gate</p>
+              <p>
+                {proxyFullName || 'The proxy'} isn&apos;t the Named Insured, so no on-site signature
+                is collected here. Submitting this intake will email
+                {proxyEmail ? ` ${proxyEmail}` : ' the proxy'} a Remote AOB Secure Signing Link to
+                review and sign the same agreement off-site.
+              </p>
+              <p className="text-amber-300/80">
+                The lead stays at NEW until the proxy signs remotely, which then locks it to AOB
+                Signed automatically.
+              </p>
+            </div>
           )}
 
           {step === 5 && policyholderMatch && (
@@ -995,20 +1151,47 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                 policyNumber={policyNumber}
               />
 
-              {provideLoaner && <RentalAgreementText operator={rentalOperator} />}
-
               <label className="flex items-start gap-2 text-xs text-zinc-300">
                 <input type="checkbox" checked={agreed} onChange={(e) => setAgreed(e.target.checked)} className="mt-0.5" />
-                {provideLoaner
-                  ? 'I have read and accept the repair terms (a)–(e) and the Rental / Loaner Agreement, and authorize the work.'
-                  : 'I have read and accept all terms (a)–(e) above and authorize the work.'}
+                I have read and accept all terms (a)–(e) above and authorize the work.
               </label>
 
               <div>
                 <p className="mb-1 font-mono text-[11px] uppercase tracking-wider text-zinc-500">
-                  Customer signature
+                  Customer signature (repair AOB)
                 </p>
                 <SignaturePad onChange={setSignatureDataUrl} />
+              </div>
+            </>
+          )}
+
+          {/* Rental / Loaner Agreement — a legally separate document from the
+              AOB above. Rendered whenever a loaner is being issued at all,
+              regardless of policyholderMatch or who the driver is. */}
+          {step === 5 && provideLoaner && (
+            <>
+              <RentalAgreementText operator={rentalOperator} />
+              <p className="text-[11px] text-amber-200">
+                {driverName || rentalOperator.name || 'The driver'} is taking custody of the loaner
+                today. This Rental / Loaner Agreement is signed separately from the repair AOB
+                {!policyholderMatch ? ', which the policyholder signs remotely' : ''}.
+              </p>
+              <label className="flex items-start gap-2 text-xs text-zinc-300">
+                <input
+                  type="checkbox"
+                  checked={rentalAgreed}
+                  onChange={(e) => setRentalAgreed(e.target.checked)}
+                  className="mt-0.5"
+                />
+                I have read and accept the Rental / Loaner Agreement on behalf of{' '}
+                {driverName || rentalOperator.name || 'the driver'}, and authorize release of the
+                vehicle.
+              </label>
+              <div>
+                <p className="mb-1 font-mono text-[11px] uppercase tracking-wider text-zinc-500">
+                  {driverName || rentalOperator.name || 'Driver'} signature (Rental Agreement)
+                </p>
+                <SignaturePad onChange={setRentalSignatureDataUrl} />
               </div>
             </>
           )}
@@ -1045,19 +1228,44 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                   />
                 )}
                 {!policyholderMatch && <Row label="Remote AOB" value="Will dispatch on submit" />}
-                {requiresOnSiteSignature && (
+                {requiresAobSignature && (
+                  <>
+                    <Row label="AOB signature" value={signatureDataUrl ? '✓ Captured' : '✗ Missing'} />
+                    <Row label="AOB agreement" value={agreed ? '✓ Accepted' : '✗ Not accepted'} />
+                  </>
+                )}
+                {requiresRentalSignature && (
                   <>
                     <Row
-                      label={policyholderMatch ? 'Signature' : 'Rental agreement signature'}
-                      value={signatureDataUrl ? '✓ Captured' : '✗ Missing'}
+                      label="Rental agreement signature"
+                      value={rentalSignatureDataUrl ? '✓ Captured' : '✗ Missing'}
                     />
-                    <Row label="Agreement" value={agreed ? '✓ Accepted' : '✗ Not accepted'} />
+                    <Row
+                      label="Rental agreement accepted"
+                      value={rentalAgreed ? '✓ Accepted' : '✗ Not accepted'}
+                    />
+                    <Row
+                      label="Driver documents"
+                      value={handoverAllowed ? '✓ OK to release' : '⚠ Missing — will hold RESERVED'}
+                    />
                   </>
                 )}
               </dl>
-              {requiresOnSiteSignature && (!signatureDataUrl || !agreed) && (
+              {requiresAobSignature && (!signatureDataUrl || !agreed) && (
                 <p className="text-[11px] text-amber-300">
-                  Signature and agreement acceptance are required (Step 5) before submitting.
+                  AOB signature and agreement acceptance are required (Step 5) before submitting.
+                </p>
+              )}
+              {requiresRentalSignature && (!rentalSignatureDataUrl || !rentalAgreed) && (
+                <p className="text-[11px] text-amber-300">
+                  Rental agreement signature and acceptance are required (Step 5) before submitting.
+                </p>
+              )}
+              {requiresRentalSignature && !handoverAllowed && (
+                <p className="text-[11px] text-amber-300">
+                  Missing driver document(s) (Step 4) — the intake will still save, but this
+                  vehicle will stay RESERVED instead of being released. Complete the document(s) in
+                  Fleet to release it.
                 </p>
               )}
             </div>
@@ -1092,7 +1300,16 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
               <button
                 type="button"
                 onClick={() => void submit()}
-                disabled={submitting || (requiresOnSiteSignature && (!signatureDataUrl || !agreed))}
+                disabled={
+                  submitting ||
+                  (requiresAobSignature && (!signatureDataUrl || !agreed)) ||
+                  (requiresRentalSignature && (!rentalSignatureDataUrl || !rentalAgreed))
+                  // Deliberately NOT gated on handoverAllowed — field-first:
+                  // a missing driver document must never cost the rep the
+                  // whole intake. See submit() below: it still saves
+                  // everything and just holds the vehicle RESERVED instead
+                  // of releasing it.
+                }
                 className="rounded-md bg-emerald-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
               >
                 {submitting ? 'Submitting…' : 'Submit Intake'}

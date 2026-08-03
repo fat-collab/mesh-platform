@@ -69,6 +69,10 @@ export interface LeadRow {
   remote_aob_token?: string | null;
   address?: string | null;
   damage_type?: DamageType | null;
+  agreement_accepted_at?: string | null;
+  rental_agreement_signature_url?: string | null;
+  rental_agreement_accepted?: boolean | null;
+  rental_agreement_signed_at?: string | null;
 }
 
 function rowToLead(row: LeadRow): IntakeLead {
@@ -106,6 +110,10 @@ function rowToLead(row: LeadRow): IntakeLead {
     remoteAobToken: row.remote_aob_token ?? undefined,
     address: row.address ?? undefined,
     damageType: row.damage_type ?? undefined,
+    agreementAcceptedAt: row.agreement_accepted_at ?? undefined,
+    rentalAgreementSignatureUrl: row.rental_agreement_signature_url ?? undefined,
+    rentalAgreementAccepted: row.rental_agreement_accepted ?? undefined,
+    rentalAgreementSignedAt: row.rental_agreement_signed_at ?? undefined,
   };
 }
 
@@ -446,6 +454,12 @@ export async function saveIntakePackage(submission: IntakeSubmission): Promise<I
     intakeDate: new Date().toISOString(),
     estimatedAmount: submission.estimatedAmount,
     agreementAccepted: Boolean(submission.signatureDataUrl),
+    agreementAcceptedAt: submission.agreementAcceptedAt || undefined,
+    rentalAgreementAccepted: Boolean(submission.rentalAgreementSignatureDataUrl),
+    rentalAgreementSignatureUrl: submission.rentalAgreementSignatureDataUrl || undefined,
+    rentalAgreementSignedAt: submission.rentalAgreementSignatureDataUrl
+      ? submission.agreementAcceptedAt || undefined
+      : undefined,
     assignedStaffId: submission.assignedStaffId,
     assignedStaffName: submission.assignedStaffName,
     // The mobile wizard IS the field agent's on-site capture tool — leads
@@ -479,6 +493,10 @@ export async function saveIntakePackage(submission: IntakeSubmission): Promise<I
       status: lead.status,
       created_at: lead.intakeDate,
       agreement_accepted: lead.agreementAccepted ?? false,
+      agreement_accepted_at: lead.agreementAcceptedAt ?? null,
+      rental_agreement_signature_url: submission.rentalAgreementSignatureDataUrl || null,
+      rental_agreement_accepted: lead.rentalAgreementAccepted ?? false,
+      rental_agreement_signed_at: lead.rentalAgreementSignedAt ?? null,
       assigned_staff_id: lead.assignedStaffId ?? null,
       assigned_staff_name: lead.assignedStaffName ?? null,
       channel: lead.channel,

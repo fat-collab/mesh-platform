@@ -586,14 +586,14 @@ export default function SalesIntakePage() {
       {wizardOpen && (
         <MobileIntakeWizard
           onClose={() => setWizardOpen(false)}
-          onComplete={(lead) => {
+          onComplete={(lead, holdMessage) => {
             setLeads((prev) => [lead, ...prev]);
             setWizardOpen(false);
-            setNotice(
+            const base =
               lead.remoteAobStatus === 'SENT'
                 ? `Mobile intake captured for ${lead.customerName} — Remote AOB link sent to the proxy policyholder.`
-                : `Mobile intake captured — new lead created for ${lead.customerName}.`,
-            );
+                : `Mobile intake captured — new lead created for ${lead.customerName}.`;
+            setNotice(holdMessage ? `${base} ${holdMessage}` : base);
           }}
         />
       )}

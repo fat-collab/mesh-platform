@@ -8,6 +8,7 @@
  */
 import { getSupabaseBrowserClient } from './supabase';
 import { executeDBOperation } from './db-guard';
+import { getCurrentProfile } from './auth';
 import { MOCK_FLEET } from './rental-mock';
 import { reserveVehicleForLead } from '@/app/actions/fleet-reservation';
 import type { RentalStatus, RentalVehicle } from '@/components/sales/types';
@@ -255,6 +256,171 @@ export async function returnVehicle(vehicleId: string, input: ReturnVehicleInput
     /* fall through to local */
   }
   patchLocal(vehicleId, patch);
+}
+
+// --- loaner driver capture ---------------------------------------------------
+// One row per loan event, not columns on rental_vehicles: the same vehicle
+// is loaned to different drivers over its life, and assignVehicle() above
+// already overwrites assigned_customer/assigned_agent on every reassignment
+// — putting license/insurance doc references directly on the vehicle row
+// would lose the previous driver's documents the same way.
+const LOAN_DRIVERS_TABLE = 'rental_loan_drivers';
+
+export interface AddRentalLoanDriverInput {
+  rentalVehicleId: string;
+  leadId?: string | null;
+  driverName: string;
+  licenseDocumentUrl?: string | null;
+  insuranceDocumentUrl?: string | null;
+}
+
+interface LocalLoanDriver extends AddRentalLoanDriverInput {}
+
+const localLoanDrivers: LocalLoanDriver[] = [];
+
+export interface RentalLoanDriverRecord {
+  id: string;
+  rentalVehicleId: string;
+  leadId: string | null;
+  driverName: string;
+  licenseDocumentUrl: string | null;
+  insuranceDocumentUrl: string | null;
+  createdAt: string;
+}
+
+interface LoanDriverRow {
+  id: string;
+  rental_vehicle_id: string;
+  lead_id: string | null;
+  driver_name: string;
+  license_document_url: string | null;
+  insurance_document_url: string | null;
+  created_at: string;
+}
+
+function rowToLoanDriver(row: LoanDriverRow): RentalLoanDriverRecord {
+  return {
+    id: row.id,
+    rentalVehicleId: row.rental_vehicle_id,
+    leadId: row.lead_id,
+    driverName: row.driver_name,
+    licenseDocumentUrl: row.license_document_url,
+    insuranceDocumentUrl: row.insurance_document_url,
+    createdAt: row.created_at,
+  };
+}
+
+/**
+ * Records who actually took the keys for a loaner — may differ from the AOB
+ * signer (see RentalAssignmentInfo.driverName). Best-effort, DB-first with a
+ * session-local mirror, matching every other write in this file.
+ */
+export async function addRentalLoanDriver(input: AddRentalLoanDriverInput): Promise<void> {
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const { error } = await supabase.from(LOAN_DRIVERS_TABLE).insert({
+      rental_vehicle_id: input.rentalVehicleId,
+      lead_id: input.leadId ?? null,
+      driver_name: input.driverName,
+      license_document_url: input.licenseDocumentUrl ?? null,
+      insurance_document_url: input.insuranceDocumentUrl ?? null,
+    });
+    if (!error) return;
+  } catch {
+    /* fall through to local */
+  }
+  localLoanDrivers.push({ ...input });
+}
+
+/**
+ * Reads the most recent loan-driver record for a vehicle (optionally scoped
+ * to a specific lead) — e.g. what the mobile wizard captured when a loaner
+ * was first reserved with a document still outstanding, so the Fleet
+ * Command Center's confirm-pickup screen can show what's already on file
+ * instead of asking the rep to start over. Returns null when nothing has
+ * been captured yet — callers must treat that as "missing everything."
+ */
+export async function getLatestLoanDriver(
+  rentalVehicleId: string,
+  leadId?: string | null,
+): Promise<RentalLoanDriverRecord | null> {
+  try {
+    const supabase = getSupabaseBrowserClient();
+    let query = supabase
+      .from(LOAN_DRIVERS_TABLE)
+      .select('*')
+      .eq('rental_vehicle_id', rentalVehicleId)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (leadId) query = query.eq('lead_id', leadId);
+    const { data, error } = await query.maybeSingle();
+    if (!error && data) return rowToLoanDriver(data as LoanDriverRow);
+    if (!error) return null;
+  } catch {
+    /* fall through to local */
+  }
+  const candidates = localLoanDrivers.filter(
+    (d) => d.rentalVehicleId === rentalVehicleId && (!leadId || d.leadId === leadId),
+  );
+  const last = candidates[candidates.length - 1];
+  return last
+    ? {
+        id: 'local',
+        rentalVehicleId: last.rentalVehicleId,
+        leadId: last.leadId ?? null,
+        driverName: last.driverName,
+        licenseDocumentUrl: last.licenseDocumentUrl ?? null,
+        insuranceDocumentUrl: last.insuranceDocumentUrl ?? null,
+        createdAt: new Date().toISOString(),
+      }
+    : null;
+}
+
+// --- per-shop handover requirements -------------------------------------------
+export type HandoverRequirementLevel = 'BLOCK' | 'WARN';
+
+export interface RentalHandoverRequirements {
+  driverLicense: HandoverRequirementLevel;
+  proofOfInsurance: HandoverRequirementLevel;
+}
+
+// Matches the migration's own column default — a network failure or an
+// unrecognized config shape must never silently loosen the gate to WARN.
+const DEFAULT_HANDOVER_REQUIREMENTS: RentalHandoverRequirements = {
+  driverLicense: 'BLOCK',
+  proofOfInsurance: 'BLOCK',
+};
+
+/**
+ * Reads the current session's org's driver-document handover policy — which
+ * documents block key release vs merely warn. Falls back to BLOCK/BLOCK
+ * (the safe default) whenever the org, the column, or the session can't be
+ * resolved, rather than defaulting open.
+ */
+export async function getRentalHandoverRequirements(): Promise<RentalHandoverRequirements> {
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const profile = await getCurrentProfile(supabase);
+    if (!profile?.organizationId) return DEFAULT_HANDOVER_REQUIREMENTS;
+    const { data, error } = await supabase
+      .from('organizations')
+      .select('rental_handover_requirements')
+      .eq('id', profile.organizationId)
+      .maybeSingle();
+    if (!error && data) {
+      const raw = (data as { rental_handover_requirements: unknown }).rental_handover_requirements;
+      if (raw && typeof raw === 'object') {
+        const r = raw as Partial<Record<keyof RentalHandoverRequirements, unknown>>;
+        return {
+          driverLicense: r.driverLicense === 'WARN' ? 'WARN' : 'BLOCK',
+          proofOfInsurance: r.proofOfInsurance === 'WARN' ? 'WARN' : 'BLOCK',
+        };
+      }
+    }
+  } catch {
+    /* fall through to the safe default */
+  }
+  return DEFAULT_HANDOVER_REQUIREMENTS;
 }
 
 /** Sets a vehicle's status directly (e.g. toggle MAINTENANCE). */

@@ -5,16 +5,29 @@
  *
  * Public, unauthenticated by design: the off-site proxy policyholder who
  * opens this link has no MESH account. The token itself is the security
- * boundary (see the remote_aob_links migration). Signing here calls
- * updateLeadStatus(..., 'AOB_SIGNED') — the same lead-status transition the
- * in-person mobile wizard triggers on-site — so the existing auto-convert-
- * to-RO business rule fires identically regardless of signing path.
+ * boundary (see the remote_aob_links migration).
+ *
+ * Two server calls, both strictly token-keyed (never accept a lead id from
+ * this page):
+ *  - GET  /api/v1/remote-aob/[token]/summary — vehicle/claim header fields
+ *    for AobAgreementText, resolved server-side from the token via
+ *    remote_aob_links, since this page's own anon client can't read the now
+ *    org-scoped intake_leads table directly.
+ *  - POST /api/v1/remote-aob/[token]/sign — records the signature and
+ *    advances the lead's status as one server-side request instead of two
+ *    independent client calls (signRemoteAobLink + updateLeadStatus), so a
+ *    failure between them is a single retryable error rather than a state
+ *    that can silently half-complete.
+ *
+ * NOTE: the auto-convert-to-RO business rule that fires when the on-site
+ * wizard signs a lead does NOT fire from this path — see the /sign route's
+ * own comment for why. A remotely-signed lead reaches AOB_SIGNED correctly;
+ * it does not auto-convert into a repair order the way on-site signing does.
  */
 import { useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
-import { getRemoteAobLink, signRemoteAobLink, type RemoteAobLinkRecord } from '@/lib/remote-aob-db';
-import { updateLeadStatus } from '@/lib/sales-db';
-import { AobAgreementText } from '@/components/sales/AobAgreementText';
+import { getRemoteAobLink, type RemoteAobLinkRecord } from '@/lib/remote-aob-db';
+import { AobAgreementText, type AobAgreementTextProps } from '@/components/sales/AobAgreementText';
 import { SignaturePad } from '@/components/sales/SignaturePad';
 
 export default function RemoteAobSigningPage() {
@@ -22,6 +35,7 @@ export default function RemoteAobSigningPage() {
   const token = params.token;
 
   const [link, setLink] = useState<RemoteAobLinkRecord | null>(null);
+  const [leadSummary, setLeadSummary] = useState<AobAgreementTextProps>({});
   const [loading, setLoading] = useState(true);
   const [signatureDataUrl, setSignatureDataUrl] = useState<string | null>(null);
   const [agreed, setAgreed] = useState(false);
@@ -33,10 +47,19 @@ export default function RemoteAobSigningPage() {
     let cancelled = false;
     void (async () => {
       const record = await getRemoteAobLink(token);
-      if (!cancelled) {
-        setLink(record);
-        setLoading(false);
+      if (cancelled) return;
+      setLink(record);
+      if (record) {
+        try {
+          const res = await fetch(`/api/v1/remote-aob/${encodeURIComponent(token)}/summary`);
+          if (res.ok && !cancelled) {
+            setLeadSummary((await res.json()) as AobAgreementTextProps);
+          }
+        } catch {
+          /* best-effort — AobAgreementText renders fine with no header line */
+        }
       }
+      if (!cancelled) setLoading(false);
     })();
     return () => {
       cancelled = true;
@@ -48,9 +71,13 @@ export default function RemoteAobSigningPage() {
     setSubmitting(true);
     setError(null);
     try {
-      const result = await signRemoteAobLink(token, signatureDataUrl);
-      if (!result) throw new Error('This signing link could not be found or has expired.');
-      await updateLeadStatus(result.leadId, 'AOB_SIGNED');
+      const res = await fetch(`/api/v1/remote-aob/${encodeURIComponent(token)}/sign`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ signatureDataUrl }),
+      });
+      const data = (await res.json()) as { error?: string };
+      if (!res.ok) throw new Error(data.error || 'Failed to submit signature.');
       setDone(true);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to submit signature.');
@@ -105,7 +132,7 @@ export default function RemoteAobSigningPage() {
           </p>
         </div>
 
-        <AobAgreementText />
+        <AobAgreementText {...leadSummary} />
 
         {error && (
           <div className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200">

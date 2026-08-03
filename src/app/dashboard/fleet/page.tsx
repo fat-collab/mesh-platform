@@ -13,10 +13,15 @@ import { clsx } from 'clsx';
 import {
   addVehicle,
   assignVehicle,
+  addRentalLoanDriver,
   getFleet,
+  getLatestLoanDriver,
+  getRentalHandoverRequirements,
   removeVehicle,
   returnVehicle,
   setVehicleStatus,
+  type RentalHandoverRequirements,
+  type RentalLoanDriverRecord,
 } from '@/lib/rental-db';
 import type { RentalStatus, RentalVehicle } from '@/components/sales/types';
 
@@ -35,6 +40,20 @@ export default function FleetPage() {
   const [assignCustomer, setAssignCustomer] = useState('');
   const [assignAgent, setAssignAgent] = useState('');
   const [assignMileage, setAssignMileage] = useState('');
+  // Driver-document handover gate — only meaningful for a RESERVED unit's
+  // Confirm Pickup (the moment keys actually change hands for a loaner the
+  // mobile wizard held back). A fresh walk-in Assign from AVAILABLE is not
+  // gated here — out of scope for this pass.
+  const [handoverRequirements, setHandoverRequirements] = useState<RentalHandoverRequirements>({
+    driverLicense: 'BLOCK',
+    proofOfInsurance: 'BLOCK',
+  });
+  const [loanDriver, setLoanDriver] = useState<RentalLoanDriverRecord | null>(null);
+  const [newDriverName, setNewDriverName] = useState('');
+  const [newLicenseFile, setNewLicenseFile] = useState<{ fileName: string; url: string } | null>(null);
+  const [newInsuranceFile, setNewInsuranceFile] = useState<{ fileName: string; url: string } | null>(
+    null,
+  );
   // Add-vehicle form.
   const [addOpen, setAddOpen] = useState(false);
   const [addMakeModel, setAddMakeModel] = useState('');
@@ -64,6 +83,17 @@ export default function FleetPage() {
       } finally {
         if (!cancelled) setLoading(false);
       }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const requirements = await getRentalHandoverRequirements();
+      if (!cancelled) setHandoverRequirements(requirements);
     })();
     return () => {
       cancelled = true;
@@ -100,9 +130,40 @@ export default function FleetPage() {
     setAssignCustomer(v.assignedCustomer ?? '');
     setAssignAgent(v.assignedAgent ?? '');
     setAssignMileage(String(v.currentMileage));
+    setNewDriverName('');
+    setNewLicenseFile(null);
+    setNewInsuranceFile(null);
+    setLoanDriver(null);
+    // Confirm Pickup on a RESERVED unit is the moment keys actually change
+    // hands — pull whatever driver documentation the wizard already
+    // captured (possibly partial, if that's why it's still RESERVED) so the
+    // rep isn't asked to start over.
+    if (v.currentStatus === 'RESERVED') {
+      void getLatestLoanDriver(v.id, v.assignedLeadId).then((record) => setLoanDriver(record));
+    }
   };
 
+  // A RESERVED unit's Confirm Pickup is gated; a fresh walk-in Assign from
+  // AVAILABLE is not (out of scope for this pass — see the state comment).
+  const licenseCaptured = (v: RentalVehicle) =>
+    Boolean(newLicenseFile) || Boolean(loanDriver?.licenseDocumentUrl) || v.currentStatus !== 'RESERVED';
+  const insuranceCaptured = (v: RentalVehicle) =>
+    Boolean(newInsuranceFile) || Boolean(loanDriver?.insuranceDocumentUrl) || v.currentStatus !== 'RESERVED';
+  const handoverAllowed = (v: RentalVehicle) =>
+    (licenseCaptured(v) || handoverRequirements.driverLicense !== 'BLOCK') &&
+    (insuranceCaptured(v) || handoverRequirements.proofOfInsurance !== 'BLOCK');
+
   const confirmAssign = async (v: RentalVehicle) => {
+    if (v.currentStatus === 'RESERVED' && !handoverAllowed(v)) return; // belt-and-suspenders; button is also disabled
+    if (v.currentStatus === 'RESERVED' && (newLicenseFile || newInsuranceFile || newDriverName.trim())) {
+      await addRentalLoanDriver({
+        rentalVehicleId: v.id,
+        leadId: v.assignedLeadId,
+        driverName: newDriverName.trim() || loanDriver?.driverName || assignCustomer.trim() || 'Unknown driver',
+        licenseDocumentUrl: newLicenseFile?.url ?? loanDriver?.licenseDocumentUrl ?? null,
+        insuranceDocumentUrl: newInsuranceFile?.url ?? loanDriver?.insuranceDocumentUrl ?? null,
+      });
+    }
     await assignVehicle(v.id, {
       // Carry the RESERVED unit's lead/RO binding through to RENTED — a
       // fresh walk-in Assign from AVAILABLE has no assignedLeadId, so this
@@ -243,6 +304,15 @@ export default function FleetPage() {
                     onAssignCustomer={setAssignCustomer}
                     onAssignAgent={setAssignAgent}
                     onAssignMileage={setAssignMileage}
+                    handoverRequirements={handoverRequirements}
+                    loanDriver={loanDriver}
+                    newDriverName={newDriverName}
+                    newLicenseFile={newLicenseFile}
+                    newInsuranceFile={newInsuranceFile}
+                    handoverAllowed={handoverAllowed(v)}
+                    onNewDriverName={setNewDriverName}
+                    onNewLicenseFile={setNewLicenseFile}
+                    onNewInsuranceFile={setNewInsuranceFile}
                     onStartAssign={() => startAssign(v)}
                     onCancelAssign={() => setAssigningId(null)}
                     onConfirmAssign={() => void confirmAssign(v)}
@@ -281,6 +351,15 @@ interface FleetRowProps {
   onAssignCustomer: (v: string) => void;
   onAssignAgent: (v: string) => void;
   onAssignMileage: (v: string) => void;
+  handoverRequirements: RentalHandoverRequirements;
+  loanDriver: RentalLoanDriverRecord | null;
+  newDriverName: string;
+  newLicenseFile: { fileName: string; url: string } | null;
+  newInsuranceFile: { fileName: string; url: string } | null;
+  handoverAllowed: boolean;
+  onNewDriverName: (v: string) => void;
+  onNewLicenseFile: (f: { fileName: string; url: string } | null) => void;
+  onNewInsuranceFile: (f: { fileName: string; url: string } | null) => void;
   onStartAssign: () => void;
   onCancelAssign: () => void;
   onConfirmAssign: () => void;
@@ -299,6 +378,15 @@ function FleetRow({
   onAssignCustomer,
   onAssignAgent,
   onAssignMileage,
+  handoverRequirements,
+  loanDriver,
+  newDriverName,
+  newLicenseFile,
+  newInsuranceFile,
+  handoverAllowed,
+  onNewDriverName,
+  onNewLicenseFile,
+  onNewInsuranceFile,
   onStartAssign,
   onCancelAssign,
   onConfirmAssign,
@@ -458,7 +546,8 @@ function FleetRow({
               <button
                 type="button"
                 onClick={onConfirmAssign}
-                className="rounded-md bg-sky-600 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-sky-500"
+                disabled={v.currentStatus === 'RESERVED' && !handoverAllowed}
+                className="rounded-md bg-sky-600 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 Confirm
               </button>
@@ -470,6 +559,98 @@ function FleetRow({
                 Cancel
               </button>
             </div>
+
+            {/* Driver-document handover gate — Confirm Pickup only. The
+                keys physically change hands here; a fresh walk-in Assign
+                from AVAILABLE isn't gated in this pass. */}
+            {v.currentStatus === 'RESERVED' && (
+              <div className="mt-2 space-y-2 rounded-md border border-zinc-700 bg-zinc-900/60 p-2.5">
+                <p className="font-mono text-[11px] uppercase tracking-wider text-zinc-500">
+                  Driver on file
+                  {loanDriver?.driverName ? ` — ${loanDriver.driverName}` : ' — none captured yet'}
+                </p>
+                <input
+                  value={newDriverName}
+                  onChange={(e) => onNewDriverName(e.target.value)}
+                  placeholder={loanDriver?.driverName || 'Driver full name'}
+                  className="w-full rounded-md border border-zinc-700 bg-zinc-950/70 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500/60 focus:outline-none"
+                />
+                <div className="grid grid-cols-2 gap-2">
+                  <label className="block">
+                    <span className="mb-1 flex items-center gap-1 text-[10px] text-zinc-500">
+                      Driver&apos;s license
+                      <span
+                        className={clsx(
+                          'rounded px-1 py-0.5 font-semibold',
+                          handoverRequirements.driverLicense === 'BLOCK'
+                            ? 'bg-red-500/15 text-red-300'
+                            : 'bg-amber-500/15 text-amber-300',
+                        )}
+                      >
+                        {handoverRequirements.driverLicense}
+                      </span>
+                    </span>
+                    {loanDriver?.licenseDocumentUrl && !newLicenseFile ? (
+                      <span className="block text-[11px] text-emerald-300">✓ Already on file</span>
+                    ) : (
+                      <input
+                        type="file"
+                        accept="image/*"
+                        onChange={(e) => {
+                          const f = e.target.files?.[0];
+                          if (f) onNewLicenseFile({ fileName: f.name, url: URL.createObjectURL(f) });
+                        }}
+                        className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
+                      />
+                    )}
+                    {newLicenseFile && (
+                      <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
+                        ✓ {newLicenseFile.fileName}
+                      </span>
+                    )}
+                  </label>
+                  <label className="block">
+                    <span className="mb-1 flex items-center gap-1 text-[10px] text-zinc-500">
+                      Proof of insurance
+                      <span
+                        className={clsx(
+                          'rounded px-1 py-0.5 font-semibold',
+                          handoverRequirements.proofOfInsurance === 'BLOCK'
+                            ? 'bg-red-500/15 text-red-300'
+                            : 'bg-amber-500/15 text-amber-300',
+                        )}
+                      >
+                        {handoverRequirements.proofOfInsurance}
+                      </span>
+                    </span>
+                    {loanDriver?.insuranceDocumentUrl && !newInsuranceFile ? (
+                      <span className="block text-[11px] text-emerald-300">✓ Already on file</span>
+                    ) : (
+                      <input
+                        type="file"
+                        accept="image/*"
+                        onChange={(e) => {
+                          const f = e.target.files?.[0];
+                          if (f) onNewInsuranceFile({ fileName: f.name, url: URL.createObjectURL(f) });
+                        }}
+                        className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
+                      />
+                    )}
+                    {newInsuranceFile && (
+                      <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
+                        ✓ {newInsuranceFile.fileName}
+                      </span>
+                    )}
+                  </label>
+                </div>
+                {!handoverAllowed && (
+                  <p className="text-[11px] text-red-300">
+                    ⚠ This shop requires the missing document(s) above before these keys can be
+                    released. Confirm is disabled until they're provided.
+                  </p>
+                )}
+              </div>
+            )}
           </td>
         </tr>
       )}

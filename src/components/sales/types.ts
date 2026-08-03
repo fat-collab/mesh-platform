@@ -33,6 +33,13 @@ export interface IntakeLead {
   estimatedAmount: number;
   /** AOB / engagement agreement signed at intake (gates RO conversion). */
   agreementAccepted?: boolean;
+  /** ISO timestamp the AOB was accepted — was captured at intake and
+   *  silently discarded before intake_leads.agreement_accepted_at existed. */
+  agreementAcceptedAt?: string;
+  /** Rental / Loaner Agreement — separate from the AOB above. */
+  rentalAgreementAccepted?: boolean;
+  rentalAgreementSignatureUrl?: string;
+  rentalAgreementSignedAt?: string;
   /** Sales rep / intake owner accountable for the lead (users.id). */
   assignedStaffId?: string;
   /** Display name of the accountable rep, denormalized for board rendering. */
@@ -233,6 +240,11 @@ export interface RentalAssignmentInfo {
   fuelLevel: number;
   preDamageNotes: string;
   expectedReturnDate: string;
+  /** Who actually took the keys — may differ from the AOB signer (the
+   *  Named Insured or their proxy). Captured separately per loan event. */
+  driverName: string;
+  driverLicenseDocUrl?: string | null;
+  driverInsuranceDocUrl?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -295,9 +307,16 @@ export interface IntakeSubmission {
   assignedStaffName?: string;
   /** Rental/loaner assignment, when a loaner was provided (dual agreement). */
   rental?: RentalAssignmentInfo | null;
-  /** PNG data URL of the customer's e-signature. Empty when the AOB is being
-   *  routed to a remote proxy policyholder instead of signed on-site. */
+  /** PNG data URL of the customer's e-signature for the repair AOB. Empty
+   *  when the AOB is being routed to a remote proxy policyholder instead of
+   *  signed on-site. Distinct from rentalAgreementSignatureDataUrl below —
+   *  these are two legally separate documents, no longer sharing one column. */
   signatureDataUrl: string;
+  /** PNG data URL of the Rental / Loaner Agreement signature. Empty unless
+   *  a loaner is actually being issued (independent of policyholderMatch —
+   *  any loaner needs this, whether the driver is the Named Insured, a
+   *  proxy, or someone else entirely). */
+  rentalAgreementSignatureDataUrl: string;
   /** ISO timestamp the service agreement was accepted. */
   agreementAcceptedAt: string;
   /** Named Insured / Policyholder Match (defaults true). */

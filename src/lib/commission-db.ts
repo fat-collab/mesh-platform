@@ -21,6 +21,7 @@
  */
 import { getSupabaseBrowserClient } from './supabase';
 import { getAssignments } from './assignments-db';
+import { getCurrentProfile } from './auth';
 import type { PayoutStatus } from './database.types';
 
 function genId(prefix: string): string {
@@ -178,8 +179,35 @@ export async function setCommissionOverride(input: SetCommissionOverrideInput): 
   });
 }
 
-/** Loads the SALES-role commission ledger, with overrides applied. */
+/**
+ * Loads the SALES-role commission ledger, with overrides applied.
+ *
+ * Scope is derived entirely from the caller's own session — never from an
+ * argument — so a rep cannot request someone else's data by passing a
+ * different id. Executives (role from getCurrentProfile) see every rep's
+ * rows, org-wide. Everyone else sees only rows where they are the RO's
+ * SALES assignee, matched via order_assignments.staff_id against
+ * getCurrentProfile().authUserId — payout_splits.tech_user_id can't be used
+ * for this; it's only ever populated for the PDR_LEAD leg (see
+ * api/v1/payments/verify/route.ts:398), never for SALES.
+ *
+ * NOTE: this scoping happens in application code after the payout_splits
+ * query already ran under the browser's session — it prevents the returned
+ * CommissionEntry[] (and therefore the UI) from exposing other reps' data,
+ * but a determined caller with a valid session could still query
+ * payout_splits directly and see the raw rows on the wire. RLS on
+ * payout_splits is the real fix for that and is an explicit follow-up, not
+ * done here.
+ */
 export async function getCommissionLedger(): Promise<CommissionEntry[]> {
+  const profile = await getCurrentProfile(getSupabaseBrowserClient());
+  const isExecutive = profile?.role === 'EXECUTIVE';
+  const callerAuthUserId = profile?.authUserId ?? null;
+  // No resolvable session and not an executive: there's no identity to
+  // scope to, so nothing is shown — fail closed, the same direction RLS
+  // would fail in.
+  if (!isExecutive && !callerAuthUserId) return [];
+
   const overrides = await getCommissionOverrides();
 
   interface RawSalesSplit {
@@ -208,6 +236,7 @@ export async function getCommissionLedger(): Promise<CommissionEntry[]> {
       for (const r of rows) {
         const assignments = await getAssignments(r.ro_id);
         const rep = assignments.find((a) => a.role === 'SALES') ?? null;
+        if (!isExecutive && rep?.staffId !== callerAuthUserId) continue;
         const override = resolveOverride(overrides, r.ro_id, rep?.staffId || null);
         const effectivePct = override?.overridePct ?? r.tech_split_pct;
         const netPayout = override
@@ -238,6 +267,7 @@ export async function getCommissionLedger(): Promise<CommissionEntry[]> {
   for (const s of SAMPLE_SALES_SPLITS) {
     const assignments = await getAssignments(s.roId);
     const rep = assignments.find((a) => a.role === 'SALES') ?? null;
+    if (!isExecutive && rep?.staffId !== callerAuthUserId) continue;
     const override = resolveOverride(overrides, s.roId, rep?.staffId || null);
     const effectivePct = override?.overridePct ?? s.basePct;
     entries.push({

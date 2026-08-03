@@ -1,0 +1,28 @@
+-- ============================================================================
+-- MESH — add SALES to public.user_role.
+--
+-- MUST run alone, as its own committed transaction, before
+-- 20260801040000 (Migration B, revised) or 20260801060000 (Migration D) —
+-- both reference the new 'SALES' value in RLS policies, and Postgres
+-- cannot add an enum value and use it in the same transaction that added
+-- it ("unsafe use of new value ... before it has been committed"). This
+-- file adds the value and nothing else, on purpose — no policy, no table,
+-- no other DDL belongs here.
+--
+-- Ordering: sorts after 20260801030000 (Migration A) and before
+-- 20260801040000 (Migration B) by filename/timestamp, so it applies and
+-- commits before either later migration needs it.
+--
+-- SALES already exists as a value in a DIFFERENT enum —
+-- public.payout_split_role (init_mesh.sql:70-74: 'PDR_LEAD','SALES','HOUSE',
+-- used by order_assignments.role and payout_splits.split_role). That is a
+-- distinct type from public.user_role (the staff-account role checked by
+-- current_user_is()/RLS everywhere in this schema). Two enums sharing a
+-- label is legal and, here, meaningful, not accidental: 'SALES' the account
+-- role (who can log in and what they're allowed to do) is a different
+-- concept from 'SALES' the assignment-role (who's credited on a specific
+-- RO's staffing roster). Documenting this so a future reader doesn't
+-- "consolidate" them.
+-- ============================================================================
+
+alter type public.user_role add value if not exists 'SALES';

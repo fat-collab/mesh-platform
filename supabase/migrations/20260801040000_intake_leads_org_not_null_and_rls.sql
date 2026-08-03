@@ -2,7 +2,14 @@
 -- MESH Sales — intake_leads: delete unresolved-org rows, set organization_id
 -- NOT NULL, org-scope RLS on intake_leads / lead_vehicles ONLY.
 -- MIGRATION B of 2 — DESTRUCTIVE. Requires 20260801030000_intake_leads_org_
--- and_vin.sql to have already run (adds + backfills organization_id).
+-- and_vin.sql (Migration A) AND 20260801035000_user_role_add_sales.sql
+-- (Migration C) to have already run and been COMMITTED — the latter adds
+-- the 'SALES' value this file's policies now reference; Postgres rejects
+-- using a new enum value inside the same transaction that added it, so C
+-- must be a separate, already-committed migration before this one runs.
+--
+-- Wrapped in an explicit transaction (begin/commit below) so the delete and
+-- the NOT NULL constraint are atomic — either both happen or neither does.
 --
 -- rental_vehicles is deliberately NOT scoped here — see the standalone
 -- comment block near the end of this file for the rationale and the
@@ -23,6 +30,8 @@
 -- a pre-existing condition of this schema's design (loose references), not
 -- something this migration introduces.
 -- ============================================================================
+
+begin;
 
 do $$
 declare
@@ -51,12 +60,11 @@ alter table public.intake_leads
   alter column organization_id set not null;
 
 -- --- intake_leads RLS ---------------------------------------------------------
--- No SALES value exists in public.user_role (it's only 'TECH','MANAGER',
--- 'ADJUSTER','CUSTOMER','EXECUTIVE' — see init_mesh.sql:40-41; 'SALES' is a
--- distinct enum used only by order_assignments/payout_splits). Sales reps
--- necessarily hold one of the existing role values, so this uses the same
--- write-role set as every other operational table in this migration set
--- rather than inventing a role check the schema can't actually express.
+-- SALES now exists in public.user_role (added by 20260801035000, committed
+-- before this file runs) — included below alongside the existing operational
+-- roles. Sales reps write leads directly (intake capture, routing), so SALES
+-- belongs on intake_leads' write policy the same way it belongs on the
+-- Migration D tables sales reps touch.
 drop policy if exists intake_leads_all on public.intake_leads;
 drop policy if exists intake_leads_select on public.intake_leads;
 drop policy if exists intake_leads_write on public.intake_leads;
@@ -69,17 +77,19 @@ create policy intake_leads_write on public.intake_leads
   for all to authenticated
   using (
     organization_id = public.current_user_org_id()
-    and public.current_user_is('TECH', 'ADJUSTER', 'MANAGER', 'EXECUTIVE')
+    and public.current_user_is('SALES', 'TECH', 'ADJUSTER', 'MANAGER', 'EXECUTIVE')
   )
   with check (
     organization_id = public.current_user_org_id()
-    and public.current_user_is('TECH', 'ADJUSTER', 'MANAGER', 'EXECUTIVE')
+    and public.current_user_is('SALES', 'TECH', 'ADJUSTER', 'MANAGER', 'EXECUTIVE')
   );
 
 -- --- lead_vehicles RLS ---------------------------------------------------------
 -- Only viable now that intake_leads has a real, NOT NULL organization_id —
 -- before this migration, lead_vehicles had no path to an org at all (see
--- 20260801020000_organization_scoped_rls.sql's skip list).
+-- 20260801020000_organization_scoped_rls.sql's skip list). SALES included
+-- for the same reason as intake_leads_write above — a lead's extra vehicles
+-- are captured by the same sales rep taking the intake.
 drop policy if exists lead_vehicles_all on public.lead_vehicles;
 drop policy if exists lead_vehicles_select on public.lead_vehicles;
 drop policy if exists lead_vehicles_write on public.lead_vehicles;
@@ -102,7 +112,7 @@ create policy lead_vehicles_write on public.lead_vehicles
       where il.id = public.lead_vehicles.lead_id
         and il.organization_id = public.current_user_org_id()
     )
-    and public.current_user_is('TECH', 'ADJUSTER', 'MANAGER', 'EXECUTIVE')
+    and public.current_user_is('SALES', 'TECH', 'ADJUSTER', 'MANAGER', 'EXECUTIVE')
   )
   with check (
     exists (
@@ -110,7 +120,7 @@ create policy lead_vehicles_write on public.lead_vehicles
       where il.id = public.lead_vehicles.lead_id
         and il.organization_id = public.current_user_org_id()
     )
-    and public.current_user_is('TECH', 'ADJUSTER', 'MANAGER', 'EXECUTIVE')
+    and public.current_user_is('SALES', 'TECH', 'ADJUSTER', 'MANAGER', 'EXECUTIVE')
   );
 
 -- --- rental_vehicles — deliberately OUT OF SCOPE for this migration -----------
@@ -152,3 +162,5 @@ create policy lead_vehicles_write on public.lead_vehicles
 -- organization_id column (which org's fleet this unit belongs to) rather
 -- than deriving one through whichever lead currently holds it.
 -- ============================================================================
+
+commit;

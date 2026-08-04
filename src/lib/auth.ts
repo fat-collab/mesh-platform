@@ -7,12 +7,14 @@ import type { MeshSupabaseClient } from './supabase';
 export interface CurrentProfile {
   authUserId: string;
   email: string | null;
+  fullName: string | null;
   role: UserRole | null;
   organizationId: string | null;
   organizationName: string | null;
 }
 
 interface ProfileRow {
+  full_name: string | null;
   role: UserRole;
   organization_id: string;
   organizations: { name: string | null } | null;
@@ -32,7 +34,7 @@ export async function getCurrentProfile(
 
   const { data } = await supabase
     .from('users')
-    .select('role, organization_id, organizations ( name )')
+    .select('full_name, role, organization_id, organizations ( name )')
     .eq('auth_user_id', user.id)
     .maybeSingle();
 
@@ -41,6 +43,7 @@ export async function getCurrentProfile(
   return {
     authUserId: user.id,
     email: user.email ?? null,
+    fullName: row?.full_name ?? null,
     role: row?.role ?? null,
     organizationId: row?.organization_id ?? null,
     organizationName: row?.organizations?.name ?? null,

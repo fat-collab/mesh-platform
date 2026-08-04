@@ -7,11 +7,11 @@
  */
 import { getSupabaseBrowserClient, type MeshSupabaseClient } from './supabase';
 import { executeDBOperation } from './db-guard';
-import { assignStaff } from './assignments-db';
 import { getCurrentProfile } from './auth';
 import { MOCK_LEADS } from './sales-mock';
 import { MOCK_BOARD_ORDERS } from './ops-mock';
 import { bridgeRepairOrder } from '@/app/actions/intake-bridge';
+import { seedSalesAssignment } from '@/app/actions/seed-sales-assignment';
 import { dispatchMobileUnit, advanceDispatchStatus } from '@/app/actions/dispatch';
 import { getCarrierIntel, CHECKLIST_ITEM_LABEL } from '@/lib/carrier-intel';
 import type {
@@ -54,6 +54,7 @@ export interface LeadRow {
   agreement_accepted?: boolean | null;
   assigned_staff_id?: string | null;
   assigned_staff_name?: string | null;
+  repair_order_id?: string | null;
   created_at: string;
   channel?: LeadChannel | null;
   storm_tag?: string | null;
@@ -124,6 +125,11 @@ function rowToLead(row: LeadRow): IntakeLead {
  * silently degrading a business-rule stop into a silently-provisioned RO.
  */
 class CarrierChecklistIncompleteError extends Error {}
+
+/** RFC4122-shaped UUID — used both to tell an app-created lead id apart from
+ *  a seed-style short id, and to validate a candidate sales-rep id before
+ *  querying with it (see resolveSalesRepId below). */
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function genId(prefix: string): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -338,6 +344,11 @@ async function bridgeIntakeToOps(leadId: string): Promise<string> {
   if (!lead) throw new Error(`Lead ${leadId} not found`);
   const submission = intakePackages[leadId];
 
+  // Candidate id — used if bridgeRepairOrder actually inserts a new row.
+  // Set into leadRoMap immediately (not after the await below) so a
+  // concurrent re-entrant call in this same session sees the early-return
+  // guard above instead of racing its own insert; corrected below if
+  // bridgeRepairOrder instead adopts an existing durably-linked RO.
   const roId = genUuid();
   leadRoMap.set(leadId, roId);
   const now = new Date().toISOString();
@@ -353,14 +364,24 @@ async function bridgeIntakeToOps(leadId: string): Promise<string> {
   // insert runs server-side with the service-role client instead. Only this
   // part — network/RLS/timeout failures on the insert itself — stays
   // best-effort, so a field rep never loses a lead on a bad connection.
+  //
+  // finalRoId may differ from the candidate roId above: bridgeRepairOrder is
+  // idempotent per lead (intake_leads.repair_order_id) and returns an
+  // existing linked RO instead of inserting a second one when this lead
+  // already has one.
+  let finalRoId = roId;
   try {
     const result = await bridgeRepairOrder({
       id: roId,
+      leadId,
       customerName: lead.customerName,
       claimNumber: lead.claimNumber || null,
       organizationId: organizationId || null,
     });
-    if (!result.success) {
+    if (result.success && result.roId) {
+      finalRoId = result.roId;
+      if (finalRoId !== roId) leadRoMap.set(leadId, finalRoId);
+    } else if (!result.success) {
       console.warn(`[sales-db] repair_orders insert failed for RO ${roId}:`, result.error);
     }
   } catch (err) {
@@ -377,7 +398,7 @@ async function bridgeIntakeToOps(leadId: string): Promise<string> {
   if (walkFlags.length) noteParts.push(`Pre-existing: ${walkFlags.join(', ')}`);
 
   MOCK_BOARD_ORDERS.push({
-    id: roId,
+    id: finalRoId,
     claim_number: lead.claimNumber || null,
     customer_name: lead.customerName,
     vehicle: `${lead.vehicleYear} ${lead.vehicleMake} ${lead.vehicleModel}`.trim(),
@@ -398,7 +419,7 @@ async function bridgeIntakeToOps(leadId: string): Promise<string> {
       url: d.url ?? null,
     })),
   });
-  return roId;
+  return finalRoId;
 }
 
 /**
@@ -646,6 +667,25 @@ export async function createQuickLead(input: QuickLeadInput): Promise<IntakeLead
   const organizationId = await resolveOrganizationId();
   const id = genId('lead');
   const vehicleMake = input.vehicleMake?.trim() ?? '';
+
+  // Same owner-capture as MobileIntakeWizard (assignedStaffId defaults to
+  // the signed-in rep's session, overridable later via assignLeadStaff) —
+  // this path never set it before, leaving every quick-captured lead
+  // ownerless. Best-effort, unlike organizationId above: a missing/failed
+  // session lookup must not block a quick capture, it just leaves the lead
+  // unowned for manual assignment.
+  let assignedStaffId: string | undefined;
+  let assignedStaffName: string | undefined;
+  try {
+    const profile = await getCurrentProfile(getSupabaseBrowserClient());
+    if (profile) {
+      assignedStaffId = profile.authUserId;
+      assignedStaffName = profile.fullName || profile.email || undefined;
+    }
+  } catch {
+    /* no session — leave owner blank for manual assignment */
+  }
+
   const lead: IntakeLead = {
     id,
     customerName: input.customerName.trim(),
@@ -665,6 +705,8 @@ export async function createQuickLead(input: QuickLeadInput): Promise<IntakeLead
     channel: 'FIELD_DISPATCH',
     address: input.address?.trim() || undefined,
     damageType: input.damageType,
+    assignedStaffId,
+    assignedStaffName,
     documents: [],
   };
 
@@ -685,6 +727,8 @@ export async function createQuickLead(input: QuickLeadInput): Promise<IntakeLead
       channel: lead.channel,
       address: lead.address ?? null,
       damage_type: lead.damageType ?? null,
+      assigned_staff_id: lead.assignedStaffId ?? null,
+      assigned_staff_name: lead.assignedStaffName ?? null,
     });
     if (error) {
       /* fall through to local store */
@@ -1027,6 +1071,70 @@ async function resolveOrganizationId(client?: MeshSupabaseClient): Promise<strin
 }
 
 /**
+ * Resolves intake_leads.assigned_staff_id to the public.users.id that
+ * repair_orders.sales_rep_id actually references. assigned_staff_id holds an
+ * auth.users.id (captured from the signed-in rep's session at intake — see
+ * MobileIntakeWizard/createQuickLead), not a public.users.id, so it must be
+ * looked up via users.auth_user_id before it can be used as sales_rep_id.
+ *
+ * Returns null rather than guessing when the value doesn't look like a UUID
+ * (demo/seed placeholders like 'staff-avery' — querying with one of those
+ * would 400 as an invalid uuid literal anyway) or doesn't match any users
+ * row (deleted user, stale/foreign auth id). A wrong owner is worse than no
+ * owner, so any lookup miss falls through to null, never a guess.
+ */
+async function resolveSalesRepId(
+  supabase: MeshSupabaseClient,
+  assignedStaffId: string | null | undefined,
+): Promise<string | null> {
+  if (!assignedStaffId || !UUID_REGEX.test(assignedStaffId)) return null;
+  const { data, error } = await supabase
+    .from('users')
+    .select('id')
+    .eq('auth_user_id', assignedStaffId)
+    .maybeSingle();
+  if (error || !data) return null;
+  return (data as { id: string }).id;
+}
+
+/**
+ * Resolves the display name to record on the initial SALES order_assignments
+ * row. intake_leads.assigned_staff_name is not trustworthy as a display name
+ * on its own — it can be null even when a real assigned_staff_id exists
+ * (confirmed live: lead 'Pamela Anderson' has a real auth.uid()-derived
+ * assigned_staff_id and a null assigned_staff_name), and historically could
+ * hold an email address instead of a name (MobileIntakeWizard fallback bug,
+ * fixed separately) — so the name is looked up fresh from
+ * public.users.full_name by auth_user_id rather than trusted from the lead
+ * row. Falls back to whatever the lead row holds only when no users row
+ * matches, so a resolvable id still gets *a* name rather than none.
+ */
+async function resolveSalesRepDisplayName(
+  supabase: MeshSupabaseClient,
+  assignedStaffId: string | null | undefined,
+  fallbackName: string | null | undefined,
+): Promise<string | null> {
+  if (assignedStaffId && UUID_REGEX.test(assignedStaffId)) {
+    try {
+      const { data, error } = await supabase
+        .from('users')
+        .select('full_name, email')
+        .eq('auth_user_id', assignedStaffId)
+        .maybeSingle();
+      if (!error && data) {
+        const row = data as { full_name: string | null; email: string | null };
+        if (row.full_name) return row.full_name;
+        if (row.email) return row.email;
+      }
+    } catch {
+      /* DB unreachable — fall through to fallbackName below, same as every
+         other best-effort lookup in this file. */
+    }
+  }
+  return fallbackName || null;
+}
+
+/**
  * Converts an approved lead into an active Production RO and returns the new RO
  * id. When an organizationId is available it runs the real multi-step DB flow
  * (provision vehicle → insert repair_order → archive the lead as CONVERTED);
@@ -1055,8 +1163,6 @@ export async function convertLeadToRO(
   // If no org id was passed, resolve from the current session, falling back
   // to the first DB org (dev fallback) — see resolveOrganizationId().
   const activeOrgId = organizationId || (await resolveOrganizationId(client));
-
-  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
   // genId('lead') produces 'lead-<uuid>', and intake_leads.id stores that
   // FULL prefixed string verbatim — confirmed against live data, including
@@ -1163,47 +1269,89 @@ export async function convertLeadToRO(
       if (vehicleError || !vehicle) {
         throw new Error(`Vehicle provisioning failed: ${vehicleError?.message}`);
       }
+      const vehicleId = (vehicle as { id: string }).id;
+      const salesRepId = await resolveSalesRepId(supabase, lead.assigned_staff_id);
 
-      // Insert the active repair order (no `vin` column on repair_orders).
-      const { data: ro, error: roError } = await supabase
-        .from('repair_orders')
-        .insert({
-          organization_id: activeOrgId,
-          vehicle_id: (vehicle as { id: string }).id,
-          customer_name: lead.customer_name,
-          claim_number: lead.claim_number,
-          stage: 'INTAKE',
-          hold_gate_active: false,
-        })
-        .select('id')
-        .single();
-      if (roError || !ro) throw new Error(`Repair order creation failed: ${roError?.message}`);
+      // If bridgeIntakeToOps already created and durably linked a
+      // repair_order for this lead (intake_leads.repair_order_id — see
+      // 20260805000000_intake_leads_repair_order_link.sql), adopt it
+      // instead of inserting a second one: a second insert with the same
+      // claim_number collides with repair_orders_org_claim_unique
+      // (confirmed live — reproduced with lead 'Pamela Anderson' during
+      // sales-rep-ownership testing). bridgeIntakeToOps's own insert never
+      // sets vehicle_id or sales_rep_id, so this still attaches both.
+      let roId: string;
+      if (lead.repair_order_id) {
+        roId = lead.repair_order_id;
+        const { error: adoptError } = await supabase
+          .from('repair_orders')
+          .update({ vehicle_id: vehicleId, sales_rep_id: salesRepId })
+          .eq('id', roId);
+        if (adoptError) throw new Error(`Repair order update failed: ${adoptError.message}`);
+      } else {
+        // Insert the active repair order (no `vin` column on repair_orders).
+        const { data: ro, error: roError } = await supabase
+          .from('repair_orders')
+          .insert({
+            organization_id: activeOrgId,
+            vehicle_id: vehicleId,
+            customer_name: lead.customer_name,
+            claim_number: lead.claim_number,
+            stage: 'INTAKE',
+            hold_gate_active: false,
+            sales_rep_id: salesRepId,
+          })
+          .select('id')
+          .single();
+        if (roError || !ro) throw new Error(`Repair order creation failed: ${roError?.message}`);
+        roId = String((ro as { id: string }).id);
+      }
 
-      // Archive lead status so it drops off the Sales intake queue. Best-effort
-      // (non-fatal): a lead sourced from the local-cache fallback above has no
-      // matching DB row to update, and that must not block RO creation.
+      // Archive lead status so it drops off the Sales intake queue, and
+      // durably record the lead -> RO link (a no-op update when adopted,
+      // since it's already set). Best-effort (non-fatal): a lead sourced
+      // from the local-cache fallback above has no matching DB row to
+      // update, and that must not block RO creation.
       const { error: updateError } = await supabase
         .from(LEADS_TABLE)
-        .update({ status: 'CONVERTED' })
+        .update({ status: 'CONVERTED', repair_order_id: roId })
         .eq('id', leadId);
       if (updateError) {
         console.warn(`[sales-db] lead status archive failed for ${leadId}:`, updateError.message);
       }
 
-      const roId = String((ro as { id: string }).id);
       leadRoMap.set(leadId, roId);
 
       // Seed the initial SALES assignment from the lead's intake owner so the
-      // accountability chain continues onto the floor. Non-fatal on failure.
-      if (lead.assigned_staff_name) {
-        try {
-          await assignStaff(roId, {
-            staffId: lead.assigned_staff_id,
-            staffName: lead.assigned_staff_name,
-            role: 'SALES',
-          });
-        } catch {
-          /* assignment is best-effort — never block the conversion */
+      // accountability chain continues onto the floor. Gated on
+      // assigned_staff_id, not assigned_staff_name — the id is what makes
+      // this attributable, and a real id can exist with a null name (see
+      // resolveSalesRepDisplayName). Non-fatal on failure.
+      if (lead.assigned_staff_id) {
+        const staffName = await resolveSalesRepDisplayName(
+          supabase,
+          lead.assigned_staff_id,
+          lead.assigned_staff_name,
+        );
+        if (staffName) {
+          // Server Action, not assignStaff: SALES has no order_assignments
+          // write grant (by design — see seed-sales-assignment.ts), so this
+          // insert has to run privileged, server-side. Best-effort — never
+          // block the conversion — but silent before today, which is
+          // exactly how Leighton McClendon's RO ended up with no
+          // order_assignments row and no trace of why.
+          try {
+            const result = await seedSalesAssignment({
+              repairOrderId: roId,
+              staffId: lead.assigned_staff_id,
+              staffName,
+            });
+            if (!result.success) {
+              console.warn(`[sales-db] initial SALES assignment failed for RO ${roId}:`, result.error);
+            }
+          } catch (err) {
+            console.warn(`[sales-db] initial SALES assignment failed for RO ${roId}:`, err);
+          }
         }
       }
 
@@ -1229,12 +1377,33 @@ export async function convertLeadToRO(
   const localLead = localLeads.find((l) => l.id === leadId);
   if (localLead) localLead.status = 'CONVERTED';
   const roId = await bridgeIntakeToOps(leadId);
-  if (localLead?.assignedStaffName) {
-    await assignStaff(roId, {
-      staffId: localLead.assignedStaffId,
-      staffName: localLead.assignedStaffName,
-      role: 'SALES',
-    });
+  // Gated on assignedStaffId, not assignedStaffName — see the DB-flow branch
+  // above for why. Same Server Action as the DB-flow branch, same reason
+  // (SALES has no order_assignments write grant). Best-effort — never block
+  // RO creation over a staffing write. If bridgeIntakeToOps's own insert
+  // (best-effort itself) never actually landed a real repair_orders row,
+  // seedSalesAssignment's caller-visibility check fails closed here — safe:
+  // it means there's no real RO id to attach an assignment to anyway.
+  if (localLead?.assignedStaffId) {
+    const staffName = await resolveSalesRepDisplayName(
+      getSupabaseBrowserClient(),
+      localLead.assignedStaffId,
+      localLead.assignedStaffName,
+    );
+    if (staffName) {
+      try {
+        const result = await seedSalesAssignment({
+          repairOrderId: roId,
+          staffId: localLead.assignedStaffId,
+          staffName,
+        });
+        if (!result.success) {
+          console.warn(`[sales-db] fallback-path staff assignment failed for RO ${roId}:`, result.error);
+        }
+      } catch (err) {
+        console.warn(`[sales-db] fallback-path staff assignment failed for RO ${roId}:`, err);
+      }
+    }
   }
   return roId;
 }

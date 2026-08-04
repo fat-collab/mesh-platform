@@ -113,6 +113,13 @@ export interface AssignStaffInput {
  * Assigns a staff member to a repair order in a role. Persists to the DB when
  * available, else records it in the session-local store. Returns the created
  * assignment (the DB row when persisted, otherwise the local record).
+ *
+ * Throws when the write reaches the DB and is rejected (RLS, a constraint,
+ * etc.) — that is a real failure a caller needs to know about, distinct from
+ * "DB unreachable" (a thrown network/connectivity exception), which still
+ * falls back to the local store below. Previously any DB-side rejection was
+ * swallowed the same as an unreachable DB and this always resolved
+ * successfully, which made every caller's surrounding try/catch dead code.
  */
 export async function assignStaff(
   repairOrderId: string,
@@ -121,9 +128,10 @@ export async function assignStaff(
   const staffName = input.staffName.trim();
   const staffId = input.staffId?.trim() || null;
 
+  let result: { data: AssignmentRow | null; error: { message: string } | null } | undefined;
   try {
     const supabase = getSupabaseBrowserClient();
-    const { data, error } = await supabase
+    const res = await supabase
       .from(TABLE)
       .insert({
         repair_order_id: repairOrderId,
@@ -133,11 +141,19 @@ export async function assignStaff(
       })
       .select('*')
       .single();
-    if (!error && data) {
-      return rowToAssignment(data as unknown as AssignmentRow);
-    }
+    result = res as unknown as { data: AssignmentRow | null; error: { message: string } | null };
   } catch {
-    /* fall through to local store */
+    /* network/connectivity failure — the request never reached the DB;
+       fall through to the local store below, same as before. */
+  }
+
+  if (result) {
+    if (result.error) {
+      throw new Error(result.error.message);
+    }
+    if (result.data) {
+      return rowToAssignment(result.data);
+    }
   }
 
   const assignment: OrderAssignment = {

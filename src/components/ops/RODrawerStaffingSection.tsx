@@ -36,6 +36,7 @@ export function RODrawerStaffingSection({ repairOrderId }: RODrawerStaffingSecti
   const [newName, setNewName] = useState('');
   const [newRole, setNewRole] = useState<StaffRole>('ESTIMATOR');
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     const rows = await getAssignments(repairOrderId);
@@ -60,10 +61,13 @@ export function RODrawerStaffingSection({ repairOrderId }: RODrawerStaffingSecti
     const name = newName.trim();
     if (!name || saving) return;
     setSaving(true);
+    setError(null);
     try {
       await assignStaff(repairOrderId, { staffName: name, role: newRole });
       setNewName('');
       await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to assign staff.');
     } finally {
       setSaving(false);
     }
@@ -166,6 +170,7 @@ export function RODrawerStaffingSection({ repairOrderId }: RODrawerStaffingSecti
               {saving ? 'Adding…' : 'Add'}
             </button>
           </div>
+          {error && <p className="text-[11px] text-red-400">{error}</p>}
         </div>
       )}
     </section>

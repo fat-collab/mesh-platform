@@ -133,6 +133,12 @@ export function ROCardView({
         role: mapOnboardingRoleToOpsRole(member.role),
       });
       loadAssignments();
+    } catch (err) {
+      // No error-display surface on this compact card (unlike the RO Detail
+      // Drawer's staffing section) — assignStaff can now throw on a genuine
+      // DB rejection, so this at least has to stop it becoming an unhandled
+      // rejection rather than silently vanishing.
+      console.warn(`[ROCard] staff assignment failed for RO ${order.id}:`, err);
     } finally {
       setAssigning(false);
     }

@@ -236,7 +236,7 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
         const profile = await getCurrentProfile(getSupabaseBrowserClient());
         if (cancelled || !profile) return;
         setAssignedStaffId(profile.authUserId);
-        setAssignedStaffName((prev) => prev || profile.email || '');
+        setAssignedStaffName((prev) => prev || profile.fullName || profile.email || '');
       } catch {
         /* no session — leave owner blank for manual entry */
       }

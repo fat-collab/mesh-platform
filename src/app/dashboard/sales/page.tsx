@@ -17,7 +17,7 @@
  *
  * Backed by sales-db with a local fallback so the board always renders.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { clsx } from 'clsx';
 import {
   LEAD_CHANNEL_LABEL,
@@ -325,6 +325,25 @@ export default function SalesIntakePage() {
     }
   }, []);
 
+  // Guards the visibility-triggered refetch below: an in-flight ref so a
+  // second trigger while one is still running short-circuits instead of
+  // firing a redundant concurrent request, plus a debounce so rapid tab
+  // switching doesn't refetch more than once every couple seconds.
+  const refetchInFlightRef = useRef(false);
+  const lastRefetchAtRef = useRef(0);
+  const REFETCH_DEBOUNCE_MS = 2000;
+
+  const guardedRefetch = useCallback(() => {
+    if (refetchInFlightRef.current) return;
+    const now = Date.now();
+    if (now - lastRefetchAtRef.current < REFETCH_DEBOUNCE_MS) return;
+    lastRefetchAtRef.current = now;
+    refetchInFlightRef.current = true;
+    void refetch().finally(() => {
+      refetchInFlightRef.current = false;
+    });
+  }, [refetch]);
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -346,16 +365,20 @@ export default function SalesIntakePage() {
   }, []);
 
   // Refresh-safe: re-pull leads when the tab/window regains focus so intake
-  // submissions / conversions from other views reflect here.
+  // submissions / conversions from other views reflect here. A single
+  // trigger (visibilitychange, only on the visible transition) — this used
+  // to also listen for `window focus`, but that fires alongside
+  // visibilitychange for the same tab-switch, producing two concurrent,
+  // redundant getLeads() calls per switch with no guard between them.
   useEffect(() => {
-    const onFocus = () => void refetch();
-    window.addEventListener('focus', onFocus);
-    document.addEventListener('visibilitychange', onFocus);
-    return () => {
-      window.removeEventListener('focus', onFocus);
-      document.removeEventListener('visibilitychange', onFocus);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') guardedRefetch();
     };
-  }, [refetch]);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [guardedRefetch]);
 
   const tabLeads = useMemo(
     () => leads.filter((l) => (l.channel ?? 'DIGITAL_INBOUND') === tab),

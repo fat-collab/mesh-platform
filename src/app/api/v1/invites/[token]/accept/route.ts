@@ -17,9 +17,20 @@
  *  - An auth account already exists for that email (e.g. they have another
  *    MESH login, or a prior accept attempt got partway through): the
  *    supplied password is verified by actually signing in with it
- *    (auth.signInWithPassword). A wrong password fails closed (401) and
- *    mutates nothing — it does not burn the invite or reveal whether the
- *    account exists beyond what createUser's own error already implies.
+ *    (auth.signInWithPassword), on a SEPARATE throwaway client — never on
+ *    `supabase` (the service-role client used for every DB call below).
+ *    Signing in on a client mutates its in-memory session, and once a
+ *    session exists that client's requests silently switch from the
+ *    service-role key to that session's own (unprivileged, org-less at this
+ *    point) access token — `persistSession: false` only stops the session
+ *    from being written to storage, it doesn't stop it from being used.
+ *    Verified live: reusing `supabase` here caused every subsequent query
+ *    (the org lookup, the users insert) to run as the invitee's own session
+ *    instead of service-role, which RLS then correctly rejected (42501) —
+ *    indistinguishable from a real RLS bug from the response alone. A wrong
+ *    password fails closed (401) and mutates nothing — it does not burn the
+ *    invite or reveal whether the account exists beyond what createUser's
+ *    own error already implies.
  *
  * Resumable by construction, same technique as the remote-AOB sign route:
  * before writing anything, it establishes which of the three steps below
@@ -51,7 +62,9 @@
  * 500: { error: string }   (write failed — safe to retry)
  */
 import { NextResponse } from 'next/server';
+import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 import { createSupabaseServerClient } from '@/lib/supabase-server';
+import { supabaseUrl, supabasePublishableKey } from '@/lib/supabase';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -147,7 +160,14 @@ export async function POST(
         { status: 500 },
       );
     }
-    const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
+    // Deliberately NOT `supabase` — signing in on the service-role client
+    // would poison it with the invitee's own session for every subsequent
+    // call in this request. This client is used once, for verification
+    // only, and discarded.
+    const verifyClient = createSupabaseClient(supabaseUrl, supabasePublishableKey, {
+      auth: { persistSession: false },
+    });
+    const { data: signInData, error: signInError } = await verifyClient.auth.signInWithPassword({
       email: invite.email,
       password,
     });

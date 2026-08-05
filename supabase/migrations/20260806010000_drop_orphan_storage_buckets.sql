@@ -24,7 +24,25 @@
 -- rather than repurposing: the intake/signature/supplement document paths
 -- these names suggest are exactly what the new private 'documents' bucket
 -- (20260806000000) now covers, with real RLS and size/MIME limits.
+--
+-- THIS MIGRATION IS INTENTIONALLY A NO-OP. A plain `delete from
+-- storage.buckets` / `storage.objects` fails with 42501
+-- ("insufficient_privilege") — Supabase installs a `storage.protect_delete()`
+-- trigger on both tables that blocks direct SQL deletion; bucket removal has
+-- to go through the Storage API (dashboard, or the JS/CLI client with a
+-- service-role key), which handles the underlying object cleanup that plain
+-- SQL isn't allowed to bypass. A migration that errors on every fresh
+-- `db push`/`db reset` is worse than no migration at all, so this file does
+-- not attempt the delete.
+--
+-- The three buckets were instead removed out-of-band via the Storage API
+-- (dashboard) after this migration was written. Confirmed live:
+-- `storage.buckets` now contains only 'documents'.
+--
+-- No action needed on a fresh environment either: since these three were
+-- never created by a migration in the first place (see the manual-creation
+-- finding above), a project bootstrapped purely from this migration history
+-- never has them to begin with — there is nothing for a fresh environment to
+-- undo. This file exists only as the historical record of the investigation
+-- and cleanup, not as a reproducible schema change.
 -- ============================================================================
-
-delete from storage.objects where bucket_id in ('intake-documents', 'signatures', 'supplement-photos');
-delete from storage.buckets where id in ('intake-documents', 'signatures', 'supplement-photos');

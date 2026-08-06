@@ -20,8 +20,8 @@ import {
   STORM_SEVERITY_LABEL,
   STORM_SEVERITY_ORDER,
   type IntakeDocKind,
-  type IntakeDocumentRef,
   type IntakeLead,
+  type PendingVehicleDocument,
   type ProxyPolicyholder,
   type StormSeverity,
 } from '@/components/sales/types';
@@ -51,15 +51,6 @@ const VAULT_SLOTS: { kind: Extract<IntakeDocKind, 'DL_FRONT' | 'DL_BACK' | 'INSU
   { kind: 'INSURANCE_CARD', label: 'Insurance Card' },
 ];
 
-function readAsDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
-}
-
 export function DigitalIntakeQuickAdd({ onClose, onComplete }: DigitalIntakeQuickAddProps) {
   const [customerName, setCustomerName] = useState('');
   const [phone, setPhone] = useState('');
@@ -73,10 +64,10 @@ export function DigitalIntakeQuickAdd({ onClose, onComplete }: DigitalIntakeQuic
   const [claimNumber, setClaimNumber] = useState('');
   const [estimatedAmount, setEstimatedAmount] = useState('');
   const [severity, setSeverity] = useState<StormSeverity>('MODERATE');
-  const [photos, setPhotos] = useState<IntakeDocumentRef[]>([]);
+  const [photos, setPhotos] = useState<PendingVehicleDocument[]>([]);
 
   // Document Vault (mandatory intake grid)
-  const [vaultDocs, setVaultDocs] = useState<Partial<Record<IntakeDocKind, IntakeDocumentRef>>>({});
+  const [vaultDocs, setVaultDocs] = useState<Partial<Record<IntakeDocKind, PendingVehicleDocument>>>({});
   const [parsedItems, setParsedItems] = useState<PartsLineItem[]>([]);
   const [parseMsg, setParseMsg] = useState<string | null>(null);
 
@@ -95,25 +86,22 @@ export function DigitalIntakeQuickAdd({ onClose, onComplete }: DigitalIntakeQuic
 
   const handlePhotos = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
-    const refs = await Promise.all(
-      Array.from(files).map(async (file) => ({
-        kind: 'DAMAGE_PHOTO' as const,
-        fileName: file.name,
-        url: await readAsDataUrl(file),
-      })),
-    );
+    const refs: PendingVehicleDocument[] = Array.from(files).map((file) => ({
+      kind: 'DAMAGE_PHOTO',
+      file,
+      fileName: file.name,
+    }));
     setPhotos((prev) => [...prev, ...refs]);
   };
 
-  const setVaultDoc = async (kind: IntakeDocKind, file: File | undefined) => {
+  const setVaultDoc = (kind: IntakeDocKind, file: File | undefined) => {
     if (!file) return;
-    const url = await readAsDataUrl(file);
-    setVaultDocs((prev) => ({ ...prev, [kind]: { kind, fileName: file.name, url } }));
+    setVaultDocs((prev) => ({ ...prev, [kind]: { kind, file, fileName: file.name } }));
   };
 
   const onEstimateFile = async (file: File | undefined) => {
     if (!file) return;
-    setVaultDocs((prev) => ({ ...prev, PRIOR_ESTIMATE: { kind: 'PRIOR_ESTIMATE', fileName: file.name, url: null } }));
+    setVaultDocs((prev) => ({ ...prev, PRIOR_ESTIMATE: { kind: 'PRIOR_ESTIMATE', file, fileName: file.name } }));
     try {
       const text = await file.text();
       const items = parseEstimate(text);
@@ -154,7 +142,7 @@ export function DigitalIntakeQuickAdd({ onClose, onComplete }: DigitalIntakeQuic
     setSubmitting(true);
     setError(null);
     try {
-      const documents: IntakeDocumentRef[] = [...Object.values(vaultDocs), ...photos];
+      const documents: PendingVehicleDocument[] = [...Object.values(vaultDocs), ...photos];
       const proxyPolicyholder: ProxyPolicyholder | null = policyholderMatch
         ? null
         : {

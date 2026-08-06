@@ -263,11 +263,28 @@ export type IntakeDocKind =
   | 'FOUR_CORNER_PHOTOS'
   | 'UNDERSIDE_BRACING_SHOTS';
 
-/** A captured/uploaded document reference (filename + local object URL). */
+/** A captured, already-uploaded document reference — points at a Storage
+ *  object path, not a directly-usable URL. Rendering one requires minting a
+ *  signed URL at read time (see the signed-URL helper), never rendering
+ *  `storagePath` itself as a link/src. `id` is present once the row is
+ *  persisted (vehicle_documents.id) — absent for the brief in-memory window
+ *  between a successful Storage upload and the DB insert that follows it. */
 export interface IntakeDocumentRef {
+  id?: string;
   kind: IntakeDocKind;
   fileName: string;
-  url?: string | null;
+  storagePath?: string | null;
+}
+
+/** A file captured in a wizard/form before the entity it belongs to exists
+ *  yet (no lead_vehicle_id/repair_order_id to attach it to) — holds the real
+ *  File in memory and defers the actual Storage upload to submit time, once
+ *  the DAL call that creates the owning row returns an id. Never persisted
+ *  or serialized as-is; always converted to an IntakeDocumentRef post-upload. */
+export interface PendingVehicleDocument {
+  kind: IntakeDocKind;
+  file: File;
+  fileName: string;
 }
 
 /** One pre-damage walkaround checklist item. */

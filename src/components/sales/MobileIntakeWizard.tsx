@@ -35,14 +35,19 @@ import type {
   HailPanelAssessment,
   HailSeverity,
   IntakeDocKind,
-  IntakeDocumentRef,
   IntakeLead,
   IntakeSubmission,
+  PendingVehicleDocument,
   ProxyPolicyholder,
   RentalAssignmentInfo,
   RentalVehicle,
   WalkaroundItem,
 } from './types';
+
+// A file captured in the wizard before submit time: holds the real File (for
+// the deferred Storage upload in saveIntakePackage) alongside a local blob:
+// URL for immediate image preview — never persisted or sent anywhere itself.
+type LocalDoc = PendingVehicleDocument & { previewUrl: string };
 
 // --- config -----------------------------------------------------------------
 
@@ -130,7 +135,7 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
   // Step 2
   const [policyNumber, setPolicyNumber] = useState('');
   const [estimatedAmount, setEstimatedAmount] = useState('');
-  const [docs, setDocs] = useState<Record<IntakeDocKind, IntakeDocumentRef | null>>({
+  const [docs, setDocs] = useState<Record<IntakeDocKind, LocalDoc | null>>({
     DL_FRONT: null,
     DL_BACK: null,
     INSURANCE_CARD: null,
@@ -151,7 +156,7 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
     Object.fromEntries(HAIL_PANELS.map((p) => [p, 'NONE'])) as Record<string, HailSeverity>,
   );
   const [conditionNotes, setConditionNotes] = useState('');
-  const [walkaroundPhotos, setWalkaroundPhotos] = useState<IntakeDocumentRef[]>([]);
+  const [walkaroundPhotos, setWalkaroundPhotos] = useState<LocalDoc[]>([]);
 
   // Step 4 — loaner / rental
   const [provideLoaner, setProvideLoaner] = useState(false);
@@ -166,8 +171,8 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
   // Not auto-filled from rentalOperator: a legal handover record should be a
   // deliberate entry, not a silent assumption.
   const [driverName, setDriverName] = useState('');
-  const [driverLicenseFile, setDriverLicenseFile] = useState<IntakeDocumentRef | null>(null);
-  const [driverInsuranceFile, setDriverInsuranceFile] = useState<IntakeDocumentRef | null>(null);
+  const [driverLicenseFile, setDriverLicenseFile] = useState<LocalDoc | null>(null);
+  const [driverInsuranceFile, setDriverInsuranceFile] = useState<LocalDoc | null>(null);
   // ATTESTED_DATA typed fields — a rep who verified the physical card/app
   // can type what it says instead of photographing it. Named distinctly
   // from the customer's own insuranceCarrier/policyNumber (Step 1, for the
@@ -312,7 +317,7 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
     if (!file) return;
     setDocs((prev) => ({
       ...prev,
-      [kind]: { kind, fileName: file.name, url: URL.createObjectURL(file) },
+      [kind]: { kind, file, fileName: file.name, previewUrl: URL.createObjectURL(file) },
     }));
   };
 
@@ -340,15 +345,16 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
 
   const addWalkaroundPhotos = (files: FileList | null) => {
     if (!files || files.length === 0) return;
-    const added: IntakeDocumentRef[] = Array.from(files).map((f) => ({
+    const added: LocalDoc[] = Array.from(files).map((f) => ({
       kind: 'WALKAROUND',
+      file: f,
       fileName: f.name,
-      url: URL.createObjectURL(f),
+      previewUrl: URL.createObjectURL(f),
     }));
     setWalkaroundPhotos((prev) => [...prev, ...added]);
   };
-  const removeWalkaroundPhoto = (url: string | null | undefined) =>
-    setWalkaroundPhotos((prev) => prev.filter((p) => p.url !== url));
+  const removeWalkaroundPhoto = (previewUrl: string | null | undefined) =>
+    setWalkaroundPhotos((prev) => prev.filter((p) => p.previewUrl !== previewUrl));
 
   // Stage-1 OCR: post a captured document to the vision service and autofill.
   const scanDocument = async (file: File | undefined, docType: 'VIN' | 'INSURANCE') => {
@@ -430,10 +436,11 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
     setSubmitting(true);
     setScanMsg(null);
     try {
-      const documents = (Object.keys(docs) as IntakeDocKind[])
+      const pendingDocuments: PendingVehicleDocument[] = (Object.keys(docs) as IntakeDocKind[])
         .map((k) => docs[k])
-        .filter((d): d is IntakeDocumentRef => d !== null)
-        .concat(walkaroundPhotos);
+        .filter((d): d is LocalDoc => d !== null)
+        .concat(walkaroundPhotos)
+        .map(({ kind, file, fileName }) => ({ kind, file, fileName }));
       const hailMatrix: HailPanelAssessment[] = HAIL_PANELS.map((panel) => ({
         panel,
         severity: hail[panel],
@@ -455,8 +462,8 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
               preDamageNotes: loanerPreDamage.trim(),
               expectedReturnDate,
               driverName: driverName.trim() || rentalOperator.name || 'Unknown driver',
-              driverLicenseDocUrl: driverLicenseFile?.url ?? null,
-              driverInsuranceDocUrl: driverInsuranceFile?.url ?? null,
+              driverLicenseDocUrl: driverLicenseFile?.previewUrl ?? null,
+              driverInsuranceDocUrl: driverInsuranceFile?.previewUrl ?? null,
             }
           : null;
 
@@ -481,7 +488,10 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
         policyNumber: policyNumber.trim(),
         claimNumber: claimNumber.trim(),
         estimatedAmount: parseFloat(estimatedAmount) || 0,
-        documents,
+        // Real documents upload separately as pendingDocuments below — this
+        // field is legacy/unused by saveIntakePackage (see its comment on
+        // leadDocumentsCache) but still required by the IntakeSubmission type.
+        documents: [],
         walkaround,
         hailMatrix,
         conditionNotes: conditionNotes.trim(),
@@ -497,7 +507,7 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
         policyholderMatch,
         proxyPolicyholder,
       };
-      const lead = await saveIntakePackage(submission);
+      const lead = await saveIntakePackage(submission, pendingDocuments);
 
       // Bind the initial insurance estimate to the supplement audit data
       // pipeline — best-effort; a parse/import failure never blocks intake.
@@ -952,10 +962,10 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                   <div className="mt-2 flex flex-wrap gap-2">
                     {walkaroundPhotos.map((p, i) => (
                       <div key={i} className="relative">
-                        {p.url ? (
+                        {p.previewUrl ? (
                           // eslint-disable-next-line @next/next/no-img-element
                           <img
-                            src={p.url}
+                            src={p.previewUrl}
                             alt={p.fileName}
                             className="h-14 w-14 rounded border border-zinc-700 object-cover"
                           />
@@ -964,7 +974,7 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                         )}
                         <button
                           type="button"
-                          onClick={() => removeWalkaroundPhoto(p.url)}
+                          onClick={() => removeWalkaroundPhoto(p.previewUrl)}
                           aria-label="Remove photo"
                           className="absolute -right-1 -top-1 rounded-full bg-zinc-800 px-1 text-[10px] font-bold text-red-300"
                         >
@@ -1100,8 +1110,9 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                                     if (f) {
                                       setDriverLicenseFile({
                                         kind: 'DL_FRONT',
+                                        file: f,
                                         fileName: f.name,
-                                        url: URL.createObjectURL(f),
+                                        previewUrl: URL.createObjectURL(f),
                                       });
                                     }
                                   }}
@@ -1162,8 +1173,9 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                                     if (f) {
                                       setDriverInsuranceFile({
                                         kind: 'INSURANCE_CARD',
+                                        file: f,
                                         fileName: f.name,
-                                        url: URL.createObjectURL(f),
+                                        previewUrl: URL.createObjectURL(f),
                                       });
                                     }
                                   }}

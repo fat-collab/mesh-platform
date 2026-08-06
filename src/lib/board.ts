@@ -97,7 +97,7 @@ export interface BoardOrder {
   /** Field-intake context carried over on conversion (visible to managers). */
   intakeNotes?: string | null;
   intakeHail?: { panel: string; severity: string }[];
-  intakeDocuments?: { kind: string; fileName: string; url?: string | null }[];
+  intakeDocuments?: { kind: string; fileName: string; storagePath?: string | null }[];
 }
 
 export type RiskTone = 'low' | 'medium' | 'high';

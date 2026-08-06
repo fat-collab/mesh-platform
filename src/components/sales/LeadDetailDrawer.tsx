@@ -13,8 +13,8 @@
 import { useEffect, useState } from 'react';
 import {
   updateLeadDetails,
-  addLeadDocument,
-  removeLeadDocument,
+  addVehicleDocument,
+  removeVehicleDocument,
   assignLeadStaff,
   type LeadDetailsPatch,
 } from '@/lib/sales-db';
@@ -130,15 +130,12 @@ export function LeadDetailDrawer({ lead, onClose, onSaved }: LeadDetailDrawerPro
     setError(null);
     try {
       const existing = documents.find((d) => d.kind === kind);
-      if (existing) {
-        await removeLeadDocument(lead.id, kind);
+      if (existing?.id) {
+        await removeVehicleDocument(existing.id);
       }
-      const updated = await addLeadDocument(lead.id, {
-        kind,
-        fileName: file.name,
-        url: URL.createObjectURL(file),
-      });
-      setDocuments(updated);
+      const ref = await addVehicleDocument(lead.id, file, kind);
+      if (!ref) throw new Error('Upload failed.');
+      setDocuments((prev) => [...prev.filter((d) => d.kind !== kind), ref]);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save the document.');
     } finally {
@@ -150,8 +147,11 @@ export function LeadDetailDrawer({ lead, onClose, onSaved }: LeadDetailDrawerPro
     setUploadingKind(kind);
     setError(null);
     try {
-      const updated = await removeLeadDocument(lead.id, kind);
-      setDocuments(updated);
+      const existing = documents.find((d) => d.kind === kind);
+      if (existing?.id) {
+        await removeVehicleDocument(existing.id);
+      }
+      setDocuments((prev) => prev.filter((d) => d.kind !== kind));
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to remove the document.');
     } finally {

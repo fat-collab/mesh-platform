@@ -697,19 +697,10 @@ export function RODetailDrawer({
                     <ul className="space-y-0.5">
                       {order.intakeDocuments.map((d, i) => (
                         <li key={i} className="truncate text-zinc-400">
-                          • {d.kind}:{' '}
-                          {d.url ? (
-                            <a
-                              href={d.url}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="text-sky-400 hover:underline"
-                            >
-                              {d.fileName}
-                            </a>
-                          ) : (
-                            d.fileName
-                          )}
+                          {/* storagePath is a Storage object path, not a usable URL —
+                              rendering it as a link needs the signed-URL-on-read
+                              helper, not built yet. Name/kind only until then. */}
+                          • {d.kind}: {d.fileName}
                         </li>
                       ))}
                     </ul>

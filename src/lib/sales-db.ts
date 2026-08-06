@@ -24,6 +24,7 @@ import type {
   LeadChannel,
   LeadStatus,
   LeadVehicle,
+  PendingVehicleDocument,
   ProxyPolicyholder,
   RemoteAobStatus,
   RoutingPath,
@@ -298,9 +299,257 @@ export async function addLeadVehicle(
   return vehicle;
 }
 
+// ---------------------------------------------------------------------------
+// Vehicle Documents — Storage-backed file attachments, one row per file.
+//
+// Replaces the old intake_leads.documents/damage_photos jsonb-array design
+// (base64 data URLs inline in the row — see the incident this migration
+// exists to fix) with vehicle_documents: real Storage objects, one row per
+// file, keyed to lead_vehicle_id. No local/session fallback here, unlike
+// the rest of this file — a failed upload or DB insert is logged and
+// returns null/skips, but there's nowhere sensible to locally mirror an
+// actual file's bytes the way a lead's status or name can be mirrored.
+// ---------------------------------------------------------------------------
+
+const VEHICLE_DOCUMENTS_TABLE = 'vehicle_documents';
+const DOCUMENTS_BUCKET = 'documents';
+
+const MIME_EXT: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+  'image/heic': 'heic',
+  'application/pdf': 'pdf',
+};
+
+/**
+ * Creates (or returns the existing) is_primary lead_vehicles row for a lead
+ * — the anchor every document upload attaches to. Idempotent against
+ * lead_vehicles_primary_unique: an insert failure (most likely a
+ * unique-violation from a retry or double-submit racing another call) falls
+ * through to selecting the row that already exists, rather than treating a
+ * race as a hard failure. Returns null (never throws) on any DB failure —
+ * callers treat a null lead_vehicle_id as "documents can't attach this
+ * time," not as a reason to fail the whole lead save.
+ */
+async function ensurePrimaryLeadVehicle(
+  leadId: string,
+  fields: { vehicleYear?: number; vehicleMake?: string; vehicleModel?: string; vinLast8?: string },
+): Promise<string | null> {
+  const supabase = getSupabaseBrowserClient();
+  try {
+    const { data: inserted, error: insertError } = await supabase
+      .from(LEAD_VEHICLES_TABLE)
+      .insert({
+        lead_id: leadId,
+        vehicle_year: fields.vehicleYear ?? null,
+        vehicle_make: fields.vehicleMake ?? null,
+        vehicle_model: fields.vehicleModel ?? null,
+        vin: fields.vinLast8 ?? null,
+        is_primary: true,
+      })
+      .select('id')
+      .maybeSingle();
+    if (!insertError && inserted) return (inserted as { id: string }).id;
+
+    const { data: existing } = await supabase
+      .from(LEAD_VEHICLES_TABLE)
+      .select('id')
+      .eq('lead_id', leadId)
+      .eq('is_primary', true)
+      .maybeSingle();
+    return existing ? (existing as { id: string }).id : null;
+  } catch (err) {
+    console.warn(`[sales-db] ensurePrimaryLeadVehicle failed for lead ${leadId}:`, err);
+    return null;
+  }
+}
+
+/**
+ * Uploads one file to the 'documents' Storage bucket and inserts its
+ * vehicle_documents row — the one place that does both, so every write call
+ * site funnels through this instead of hand-rolling Storage + DB calls.
+ * Best-effort: returns null on failure (Storage or DB), logs a warning,
+ * never throws — a failed document upload must not fail the lead/RO save
+ * it's attached to.
+ */
+async function uploadVehicleDocument(
+  leadVehicleId: string,
+  organizationId: string,
+  leadId: string,
+  file: File,
+  kind: IntakeDocKind,
+): Promise<IntakeDocumentRef | null> {
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const ext = MIME_EXT[file.type] ?? (file.name.split('.').pop() || 'bin');
+    const path = `${organizationId}/leads/${leadId}/vehicles/${leadVehicleId}/documents/${kind}-${genUuid()}.${ext}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from(DOCUMENTS_BUCKET)
+      .upload(path, file, { contentType: file.type || undefined, upsert: false });
+    if (uploadError) {
+      console.warn(
+        `[sales-db] Storage upload failed for ${kind} on lead_vehicle ${leadVehicleId}:`,
+        uploadError.message,
+      );
+      return null;
+    }
+
+    const { data: row, error: insertError } = await supabase
+      .from(VEHICLE_DOCUMENTS_TABLE)
+      .insert({
+        organization_id: organizationId,
+        lead_vehicle_id: leadVehicleId,
+        kind,
+        file_name: file.name,
+        storage_path: path,
+        byte_size: file.size,
+        mime_type: file.type || null,
+      })
+      .select('id')
+      .single();
+    if (insertError || !row) {
+      console.warn(
+        `[sales-db] vehicle_documents insert failed for ${kind} on lead_vehicle ${leadVehicleId}:`,
+        insertError?.message,
+      );
+      return null;
+    }
+
+    return { id: (row as { id: string }).id, kind, fileName: file.name, storagePath: path };
+  } catch (err) {
+    console.warn(`[sales-db] uploadVehicleDocument failed for ${kind} on lead_vehicle ${leadVehicleId}:`, err);
+    return null;
+  }
+}
+
+/**
+ * Uploads every pending file for a lead_vehicle, skipping (with a warning)
+ * any that individually fail rather than aborting the batch — a save should
+ * end with as many documents captured as possible, not zero because one
+ * upload failed. Returns [] without attempting anything if leadVehicleId is
+ * null (ensurePrimaryLeadVehicle failed) — there's nowhere to attach to.
+ */
+async function uploadPendingDocuments(
+  leadVehicleId: string | null,
+  organizationId: string,
+  leadId: string,
+  pending: PendingVehicleDocument[],
+): Promise<IntakeDocumentRef[]> {
+  if (!leadVehicleId || pending.length === 0) return [];
+  const uploaded: IntakeDocumentRef[] = [];
+  for (const doc of pending) {
+    const ref = await uploadVehicleDocument(leadVehicleId, organizationId, leadId, doc.file, doc.kind);
+    if (ref) uploaded.push(ref);
+  }
+  return uploaded;
+}
+
+/**
+ * Uploads a signature/rental-signature capture — a small base64 PNG held
+ * transiently in wizard state (kilobytes, not the multi-MB photos that
+ * caused the original incident, so keeping it in memory as base64 until
+ * this call is fine) — to Storage, returning the object path to persist
+ * instead of writing the base64 itself into the DB. Best-effort: returns
+ * null on any failure, same as every other write in this file.
+ */
+async function uploadSignature(
+  organizationId: string,
+  leadId: string,
+  dataUrl: string,
+  fileNamePrefix: string,
+): Promise<string | null> {
+  try {
+    const blob = await (await fetch(dataUrl)).blob();
+    const ext = MIME_EXT[blob.type] ?? 'png';
+    const path = `${organizationId}/leads/${leadId}/${fileNamePrefix}-${genUuid()}.${ext}`;
+
+    const supabase = getSupabaseBrowserClient();
+    const { error } = await supabase.storage
+      .from(DOCUMENTS_BUCKET)
+      .upload(path, blob, { contentType: blob.type || 'image/png', upsert: false });
+    if (error) {
+      console.warn(`[sales-db] signature upload failed for lead ${leadId}:`, error.message);
+      return null;
+    }
+    return path;
+  } catch (err) {
+    console.warn(`[sales-db] uploadSignature failed for lead ${leadId}:`, err);
+    return null;
+  }
+}
+
+/**
+ * Lists a vehicle's captured documents, most recent first. Bounded at 100 —
+ * proportionate to a Sales-side lead drawer, not the hundreds-per-vehicle
+ * volume a hail job can produce on the Ops/RO side (that needs real
+ * pagination, not built here).
+ */
+export async function listVehicleDocuments(leadVehicleId: string): Promise<IntakeDocumentRef[]> {
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const { data, error } = await supabase
+      .from(VEHICLE_DOCUMENTS_TABLE)
+      .select('id, kind, file_name, storage_path')
+      .eq('lead_vehicle_id', leadVehicleId)
+      .order('created_at', { ascending: false })
+      .limit(100);
+    if (error || !data) return [];
+    return (data as { id: string; kind: IntakeDocKind; file_name: string | null; storage_path: string }[]).map(
+      (row) => ({
+        id: row.id,
+        kind: row.kind,
+        fileName: row.file_name ?? '',
+        storagePath: row.storage_path,
+      }),
+    );
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Removes a document: deletes the Storage object, then the row. A Storage
+ * failure still proceeds to delete the row rather than leaving a reference
+ * the UI keeps showing for an object that may or may not still exist.
+ */
+export async function removeVehicleDocument(documentId: string): Promise<void> {
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const { data: row, error: fetchError } = await supabase
+      .from(VEHICLE_DOCUMENTS_TABLE)
+      .select('storage_path')
+      .eq('id', documentId)
+      .maybeSingle();
+    if (fetchError || !row) return;
+
+    const { error: removeError } = await supabase.storage
+      .from(DOCUMENTS_BUCKET)
+      .remove([(row as { storage_path: string }).storage_path]);
+    if (removeError) {
+      console.warn(`[sales-db] Storage remove failed for document ${documentId}:`, removeError.message);
+    }
+
+    const { error: deleteError } = await supabase.from(VEHICLE_DOCUMENTS_TABLE).delete().eq('id', documentId);
+    if (deleteError) {
+      console.warn(`[sales-db] vehicle_documents delete failed for ${documentId}:`, deleteError.message);
+    }
+  } catch (err) {
+    console.warn(`[sales-db] removeVehicleDocument failed for ${documentId}:`, err);
+  }
+}
+
 // Session-local store of full intake packages (document refs + signature +
 // walkaround), keyed by the created lead id.
 const intakePackages: Record<string, IntakeSubmission> = {};
+
+// Uploaded vehicle_documents refs for a just-saved intake, keyed by lead id.
+// IntakeSubmission.documents is not used for this anymore (see
+// saveIntakePackage) — bridgeIntakeToOps reads the real, already-uploaded
+// refs from here instead, since a base64/blob string was never a valid
+// storagePath to begin with.
+const leadDocumentsCache = new Map<string, IntakeDocumentRef[]>();
 
 // Tracks which leads already have a bridged RO, so intake auto-creation and a
 // later manual convert don't create duplicate ROs.
@@ -413,10 +662,10 @@ async function bridgeIntakeToOps(leadId: string): Promise<string> {
     assignedStaffName: lead.assignedStaffName || null,
     intakeNotes: noteParts.join(' · ') || null,
     intakeHail: activeHail.map((h) => ({ panel: h.panel, severity: h.severity })),
-    intakeDocuments: (submission?.documents ?? []).map((d) => ({
+    intakeDocuments: (leadDocumentsCache.get(leadId) ?? []).map((d) => ({
       kind: d.kind,
       fileName: d.fileName,
-      url: d.url ?? null,
+      storagePath: d.storagePath ?? null,
     })),
   });
   return finalRoId;
@@ -450,7 +699,10 @@ async function maybeAutoConvertOnAobSigned(leadId: string, status: LeadStatus, c
  * lead routed to a remote proxy policyholder instead (no on-site signature)
  * is created at NEW, pending the Remote AOB Execution Gate.
  */
-export async function saveIntakePackage(submission: IntakeSubmission): Promise<IntakeLead> {
+export async function saveIntakePackage(
+  submission: IntakeSubmission,
+  pendingDocuments: PendingVehicleDocument[] = [],
+): Promise<IntakeLead> {
   ensureSeed();
   // Resolves the caller's org or throws — a lead can never be written
   // (DB or local fallback) without one. Runs before any write, local
@@ -460,6 +712,18 @@ export async function saveIntakePackage(submission: IntakeSubmission): Promise<I
   const id = genId('lead');
   const status: LeadStatus = submission.signatureDataUrl ? 'AOB_SIGNED' : 'NEW';
   const policyholderMatch = submission.policyholderMatch ?? true;
+
+  // Signatures upload to Storage before the insert, same as every other
+  // document — the DB only ever holds a storage path, never base64. Small
+  // (kilobytes) and short-lived in memory as base64 until this call, unlike
+  // the multi-MB photos that caused the original incident.
+  const signatureUrl = submission.signatureDataUrl
+    ? await uploadSignature(organizationId, id, submission.signatureDataUrl, 'signature')
+    : null;
+  const rentalSignatureUrl = submission.rentalAgreementSignatureDataUrl
+    ? await uploadSignature(organizationId, id, submission.rentalAgreementSignatureDataUrl, 'rental-signature')
+    : null;
+
   const lead: IntakeLead = {
     id,
     customerName: submission.customerName,
@@ -477,7 +741,7 @@ export async function saveIntakePackage(submission: IntakeSubmission): Promise<I
     agreementAccepted: Boolean(submission.signatureDataUrl),
     agreementAcceptedAt: submission.agreementAcceptedAt || undefined,
     rentalAgreementAccepted: Boolean(submission.rentalAgreementSignatureDataUrl),
-    rentalAgreementSignatureUrl: submission.rentalAgreementSignatureDataUrl || undefined,
+    rentalAgreementSignatureUrl: rentalSignatureUrl || undefined,
     rentalAgreementSignedAt: submission.rentalAgreementSignatureDataUrl
       ? submission.agreementAcceptedAt || undefined
       : undefined,
@@ -489,7 +753,6 @@ export async function saveIntakePackage(submission: IntakeSubmission): Promise<I
     policyholderMatch,
     proxyPolicyholder: policyholderMatch ? undefined : submission.proxyPolicyholder ?? undefined,
     remoteAobStatus: policyholderMatch ? undefined : 'NOT_SENT',
-    documents: submission.documents,
   };
 
   try {
@@ -508,14 +771,14 @@ export async function saveIntakePackage(submission: IntakeSubmission): Promise<I
       insurance_carrier: lead.insuranceCarrier,
       claim_number: lead.claimNumber,
       estimated_amount: lead.estimatedAmount,
-      documents: submission.documents,
+      documents: [],
       walkaround_notes: submission.walkaround,
-      signature_url: submission.signatureDataUrl || null,
+      signature_url: signatureUrl,
       status: lead.status,
       created_at: lead.intakeDate,
       agreement_accepted: lead.agreementAccepted ?? false,
       agreement_accepted_at: lead.agreementAcceptedAt ?? null,
-      rental_agreement_signature_url: submission.rentalAgreementSignatureDataUrl || null,
+      rental_agreement_signature_url: rentalSignatureUrl,
       rental_agreement_accepted: lead.rentalAgreementAccepted ?? false,
       rental_agreement_signed_at: lead.rentalAgreementSignedAt ?? null,
       assigned_staff_id: lead.assignedStaffId ?? null,
@@ -531,6 +794,20 @@ export async function saveIntakePackage(submission: IntakeSubmission): Promise<I
   } catch {
     /* fall through to local store */
   }
+
+  // Primary lead_vehicles row + document uploads, after the insert attempt
+  // above but not gated on it succeeding — ensurePrimaryLeadVehicle/
+  // uploadPendingDocuments are their own best-effort calls and simply
+  // return null/[] if intake_leads or lead_vehicles aren't reachable.
+  const leadVehicleId = await ensurePrimaryLeadVehicle(id, {
+    vehicleYear: submission.vehicleYear,
+    vehicleMake: submission.vehicleMake,
+    vehicleModel: submission.vehicleModel,
+    vinLast8: submission.vinLast8,
+  });
+  const uploadedDocs = await uploadPendingDocuments(leadVehicleId, organizationId, id, pendingDocuments);
+  leadDocumentsCache.set(id, uploadedDocs);
+  lead.documents = uploadedDocs.length > 0 ? uploadedDocs : undefined;
 
   localLeads.unshift({ ...lead });
   intakePackages[id] = submission;
@@ -565,9 +842,9 @@ export interface DigitalLeadInput {
   zipCode: string;
   severity: StormSeverity;
   /** Full captured document vault (DL front/back, insurance card, prior
-   *  estimate, dynamic carrier checklist, damage photos) — persisted as-is
-   *  to the intake_leads.documents column. */
-  documents: IntakeDocumentRef[];
+   *  estimate, dynamic carrier checklist, damage photos) — held as pending
+   *  Files, uploaded to Storage after the lead + primary vehicle exist. */
+  documents: PendingVehicleDocument[];
   policyholderMatch: boolean;
   proxyPolicyholder?: ProxyPolicyholder | null;
 }
@@ -601,11 +878,9 @@ export async function createDigitalLead(input: DigitalLeadInput): Promise<Intake
     stormTag: input.stormTag || undefined,
     zipCode: input.zipCode || undefined,
     severity: input.severity,
-    damagePhotos: input.documents.filter((d) => d.kind === 'DAMAGE_PHOTO'),
     policyholderMatch: input.policyholderMatch,
     proxyPolicyholder: input.policyholderMatch ? undefined : input.proxyPolicyholder ?? undefined,
     remoteAobStatus: input.policyholderMatch ? undefined : 'NOT_SENT',
-    documents: input.documents,
   };
 
   try {
@@ -623,7 +898,7 @@ export async function createDigitalLead(input: DigitalLeadInput): Promise<Intake
       insurance_carrier: lead.insuranceCarrier,
       claim_number: lead.claimNumber,
       estimated_amount: lead.estimatedAmount,
-      documents: input.documents,
+      documents: [],
       walkaround_notes: [],
       status: lead.status,
       created_at: lead.intakeDate,
@@ -631,7 +906,7 @@ export async function createDigitalLead(input: DigitalLeadInput): Promise<Intake
       storm_tag: lead.stormTag ?? null,
       zip_code: lead.zipCode ?? null,
       severity: lead.severity ?? null,
-      damage_photos: lead.damagePhotos ?? [],
+      damage_photos: [],
       policyholder_match: lead.policyholderMatch,
       proxy_policyholder: lead.proxyPolicyholder ?? null,
       remote_aob_status: lead.remoteAobStatus ?? null,
@@ -642,6 +917,15 @@ export async function createDigitalLead(input: DigitalLeadInput): Promise<Intake
   } catch {
     /* fall through to local store */
   }
+
+  const leadVehicleId = await ensurePrimaryLeadVehicle(id, {
+    vehicleYear: input.vehicleYear,
+    vehicleMake: input.vehicleMake,
+    vehicleModel: input.vehicleModel,
+  });
+  const uploadedDocs = await uploadPendingDocuments(leadVehicleId, organizationId, id, input.documents);
+  lead.documents = uploadedDocs.length > 0 ? uploadedDocs : undefined;
+  lead.damagePhotos = uploadedDocs.filter((d) => d.kind === 'DAMAGE_PHOTO');
 
   localLeads.unshift({ ...lead });
   return lead;
@@ -736,6 +1020,12 @@ export async function createQuickLead(input: QuickLeadInput): Promise<IntakeLead
   } catch {
     /* fall through to local store */
   }
+
+  // No documents captured at this flow — vehicle fields are largely empty
+  // too (a quick porch capture is name-first, everything else filled in
+  // later) — but the primary lead_vehicles row still needs to exist now, so
+  // a later LeadDetailDrawer upload has somewhere to attach to.
+  await ensurePrimaryLeadVehicle(id, { vehicleMake });
 
   localLeads.unshift({ ...lead });
   return lead;
@@ -881,78 +1171,33 @@ function applyLeadDetailsPatchLocally(id: string, patch: LeadDetailsPatch): void
   if (patch.estimatedAmount !== undefined) lead.estimatedAmount = patch.estimatedAmount;
 }
 
-async function getLeadDocuments(leadId: string): Promise<IntakeDocumentRef[]> {
-  try {
-    const supabase = getSupabaseBrowserClient();
-    const { data, error } = await supabase
-      .from(LEADS_TABLE)
-      .select('documents')
-      .eq('id', leadId)
-      .maybeSingle();
-    if (!error && data) {
-      const docs = (data as { documents: unknown }).documents;
-      if (Array.isArray(docs)) return docs as IntakeDocumentRef[];
-    }
-  } catch {
-    /* fall through to local */
-  }
-  ensureSeed();
-  const lead = localLeads.find((l) => l.id === leadId);
-  return lead?.documents ? [...lead.documents] : [];
-}
-
-async function writeLeadDocuments(leadId: string, docs: IntakeDocumentRef[]): Promise<void> {
-  try {
-    const supabase = getSupabaseBrowserClient();
-    const { data, error } = await supabase
-      .from(LEADS_TABLE)
-      .update({ documents: docs })
-      .eq('id', leadId)
-      .select('id');
-    if (!error && data && data.length > 0) {
-      const lead = localLeads.find((l) => l.id === leadId);
-      if (lead) lead.documents = docs;
-      return;
-    }
-  } catch {
-    /* fall through to local-only */
-  }
-  ensureSeed();
-  const lead = localLeads.find((l) => l.id === leadId);
-  if (lead) lead.documents = docs;
-}
-
 /**
- * Appends a captured document to a lead's document vault — read-modify-write
- * against intake_leads.documents, preserving whatever was already there.
- * Does not dedupe by kind: replacing a wrong upload is an explicit two-step
- * action (removeLeadDocument then addLeadDocument), not an implicit upsert.
- * Returns the full updated document list so the caller can update its view
- * without a separate refetch.
+ * Uploads one document for an existing lead's primary vehicle — resolves
+ * (or creates, if somehow missing) the primary lead_vehicles row, then
+ * uploads via uploadVehicleDocument. The entry point for post-intake
+ * uploads (e.g. LeadDetailDrawer), where the lead already exists so there's
+ * no sequencing problem: this uploads immediately, not deferred like the
+ * wizard flows in saveIntakePackage/createDigitalLead above.
+ *
+ * Replaces addLeadDocument/removeLeadDocument's old read-modify-write
+ * against intake_leads.documents (kind-only removal, no way to tell two
+ * DAMAGE_PHOTOs apart) — removal is now removeVehicleDocument(documentId),
+ * targeting one row, not "every document of this kind."
  */
-export async function addLeadDocument(
+export async function addVehicleDocument(
   leadId: string,
-  doc: IntakeDocumentRef,
-): Promise<IntakeDocumentRef[]> {
-  const current = await getLeadDocuments(leadId);
-  const next = [...current, doc];
-  await writeLeadDocuments(leadId, next);
-  return next;
-}
-
-/**
- * Removes every document of the given kind from a lead's document vault —
- * the first half of "replace a wrong upload" (call addLeadDocument after to
- * add the corrected one). Returns the full updated document list.
- */
-export async function removeLeadDocument(
-  leadId: string,
+  file: File,
   kind: IntakeDocKind,
-): Promise<IntakeDocumentRef[]> {
-  const current = await getLeadDocuments(leadId);
-  const next = current.filter((d) => d.kind !== kind);
-  await writeLeadDocuments(leadId, next);
-  return next;
+): Promise<IntakeDocumentRef | null> {
+  try {
+    const organizationId = await resolveOrganizationId();
+    const leadVehicleId = await ensurePrimaryLeadVehicle(leadId, {});
+    if (!leadVehicleId) return null;
+    return uploadVehicleDocument(leadVehicleId, organizationId, leadId, file, kind);
+  } catch (err) {
+    console.warn(`[sales-db] addVehicleDocument failed for lead ${leadId}:`, err);
+    return null;
+  }
 }
 
 /**
@@ -1196,11 +1441,12 @@ export async function convertLeadToRO(
       // from the active local cache, and continue provisioning the RO from
       // it instead of throwing.
       //
-      // NOTE: documents is set to {} below — localLeads/IntakeLead doesn't
-      // retain the original IntakeDocumentRef[] captured at intake. Any lead
-      // reconstructed through this branch will therefore always show every
-      // carrier-checklist item as missing under the gate a few lines down,
-      // regardless of what was actually captured. Known gap, not fixed here.
+      // documents/walkaround_notes below are placeholder values on this
+      // reconstructed row — they're vestigial now that the carrier-checklist
+      // gate a few lines down reads vehicle_documents (via lead_vehicles,
+      // queried independently of this row) rather than an intake_leads.
+      // documents jsonb value, so this branch no longer under-reports
+      // captured documents the way it used to.
       //
       // Only for browser callers (no explicit client). localLeads is
       // module-scope state private to whichever JS runtime is executing —
@@ -1233,19 +1479,34 @@ export async function convertLeadToRO(
       // of dereferencing a null lead a few lines down.
       if (!lead) throw new Error(`Lead ${leadId} not found`);
 
+      // Resolved once, used by both the checklist gate below and the
+      // vehicle_documents.repair_order_id backfill after RO creation.
+      const { data: primaryVehicle } = await supabase
+        .from(LEAD_VEHICLES_TABLE)
+        .select('id')
+        .eq('lead_id', leadId)
+        .eq('is_primary', true)
+        .maybeSingle();
+      const leadVehicleId = primaryVehicle ? (primaryVehicle as { id: string }).id : null;
+
       // Carrier-checklist gate — moved here from MobileIntakeWizard's step-2
       // canProceed(), which used to block the LEAD from being saved at all.
       // Now the lead always saves; this blocks only RO provisioning, naming
       // exactly what's missing so an office coordinator knows what to chase.
+      // Reads vehicle_documents directly rather than an intake_leads.
+      // documents jsonb snapshot — a missing leadVehicleId (e.g. a
+      // pre-fan-out lead with no primary row yet) means an empty captured
+      // set, same as any other lead with no documents.
       const requiredChecklist = getCarrierIntel(lead.insurance_carrier ?? '').requiredChecklist;
       if (requiredChecklist.length > 0) {
-        const capturedKinds = new Set(
-          Array.isArray(lead.documents)
-            ? (lead.documents as IntakeDocumentRef[])
-                .filter((d) => d && typeof d === 'object' && 'kind' in d)
-                .map((d) => d.kind)
-            : [],
-        );
+        const capturedKinds = new Set<IntakeDocKind>();
+        if (leadVehicleId) {
+          const { data: docs } = await supabase
+            .from(VEHICLE_DOCUMENTS_TABLE)
+            .select('kind')
+            .eq('lead_vehicle_id', leadVehicleId);
+          for (const row of (docs ?? []) as { kind: IntakeDocKind }[]) capturedKinds.add(row.kind);
+        }
         const missing = requiredChecklist.filter((kind) => !capturedKinds.has(kind));
         if (missing.length > 0) {
           throw new CarrierChecklistIncompleteError(
@@ -1321,6 +1582,26 @@ export async function convertLeadToRO(
       }
 
       leadRoMap.set(leadId, roId);
+
+      // Durably attach this vehicle's already-uploaded documents to the RO,
+      // so Ops-side reads (RODetailDrawer, invoice, proof-of-payment) can
+      // index on repair_order_id directly with no join back through
+      // lead_vehicles. Non-fatal: a failure here leaves documents reachable
+      // via lead_vehicle_id only, which still works, just not on the RO-side
+      // query path.
+      if (leadVehicleId) {
+        const { error: backfillError } = await supabase
+          .from(VEHICLE_DOCUMENTS_TABLE)
+          .update({ repair_order_id: roId })
+          .eq('lead_vehicle_id', leadVehicleId)
+          .is('repair_order_id', null);
+        if (backfillError) {
+          console.warn(
+            `[sales-db] vehicle_documents repair_order_id backfill failed for RO ${roId}:`,
+            backfillError.message,
+          );
+        }
+      }
 
       // Seed the initial SALES assignment from the lead's intake owner so the
       // accountability chain continues onto the floor. Gated on

@@ -14,6 +14,7 @@ import { bridgeRepairOrder } from '@/app/actions/intake-bridge';
 import { seedSalesAssignment } from '@/app/actions/seed-sales-assignment';
 import { dispatchMobileUnit, advanceDispatchStatus } from '@/app/actions/dispatch';
 import { getCarrierIntel, CHECKLIST_ITEM_LABEL } from '@/lib/carrier-intel';
+import { DOCUMENTS_BUCKET, MIME_EXT, uploadDocumentFile } from '@/lib/storage-upload';
 import type {
   DamageType,
   DispatchStatus,
@@ -312,62 +313,6 @@ export async function addLeadVehicle(
 // ---------------------------------------------------------------------------
 
 const VEHICLE_DOCUMENTS_TABLE = 'vehicle_documents';
-const DOCUMENTS_BUCKET = 'documents';
-
-const MIME_EXT: Record<string, string> = {
-  'image/jpeg': 'jpg',
-  'image/png': 'png',
-  'image/webp': 'webp',
-  'image/heic': 'heic',
-  'application/pdf': 'pdf',
-};
-
-const COMPRESS_MAX_DIMENSION = 2000;
-const COMPRESS_QUALITY = 0.8;
-
-/**
- * Downscales + re-encodes an image File before it ever reaches Storage — a
- * driver's license photo landed at 12MB uncompressed; twenty hail-panel
- * shots at that size is a gigabyte per vehicle, over cellular. Resizes to a
- * ~2000px long edge (never upscales) and always re-encodes as JPEG at 80%
- * quality, so a large lossless PNG screenshot benefits even when it's
- * already under the size cap. Non-image files (PRIOR_ESTIMATE's
- * json/xml/csv/txt/pdf) pass through untouched — running them through
- * canvas would corrupt them. HEIC decode support is inconsistent outside
- * Safari; any decode/encode failure falls back to uploading the original
- * file rather than failing the upload — the bucket's 15MB hard limit is the
- * real backstop either way.
- */
-async function compressImageFile(file: File): Promise<File> {
-  if (!file.type.startsWith('image/')) return file;
-  let bitmap: ImageBitmap | null = null;
-  try {
-    bitmap = await createImageBitmap(file);
-    const scale = Math.min(1, COMPRESS_MAX_DIMENSION / Math.max(bitmap.width, bitmap.height));
-    const width = Math.round(bitmap.width * scale);
-    const height = Math.round(bitmap.height * scale);
-
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return file;
-    ctx.drawImage(bitmap, 0, 0, width, height);
-
-    const blob: Blob | null = await new Promise((resolve) =>
-      canvas.toBlob(resolve, 'image/jpeg', COMPRESS_QUALITY),
-    );
-    if (!blob) return file;
-
-    const compressedName = `${file.name.replace(/\.[^./]+$/, '')}.jpg`;
-    return new File([blob], compressedName, { type: 'image/jpeg' });
-  } catch (err) {
-    console.warn(`[sales-db] image compression failed for ${file.name}, uploading original:`, err);
-    return file;
-  } finally {
-    bitmap?.close();
-  }
-}
 
 /**
  * Creates (or returns the existing) is_primary lead_vehicles row for a lead
@@ -428,22 +373,15 @@ async function uploadVehicleDocument(
   kind: IntakeDocKind,
 ): Promise<IntakeDocumentRef | null> {
   try {
-    const uploadFile = await compressImageFile(file);
-    const supabase = getSupabaseBrowserClient();
-    const ext = MIME_EXT[uploadFile.type] ?? (uploadFile.name.split('.').pop() || 'bin');
-    const path = `${organizationId}/leads/${leadId}/vehicles/${leadVehicleId}/documents/${kind}-${genUuid()}.${ext}`;
-
-    const { error: uploadError } = await supabase.storage
-      .from(DOCUMENTS_BUCKET)
-      .upload(path, uploadFile, { contentType: uploadFile.type || undefined, upsert: false });
-    if (uploadError) {
-      console.warn(
-        `[sales-db] Storage upload failed for ${kind} on lead_vehicle ${leadVehicleId}:`,
-        uploadError.message,
-      );
+    const pathWithoutExt = `${organizationId}/leads/${leadId}/vehicles/${leadVehicleId}/documents/${kind}-${genUuid()}`;
+    const uploaded = await uploadDocumentFile(pathWithoutExt, file);
+    if (!uploaded) {
+      console.warn(`[sales-db] Storage upload failed for ${kind} on lead_vehicle ${leadVehicleId}`);
       return null;
     }
+    const { path, file: uploadFile } = uploaded;
 
+    const supabase = getSupabaseBrowserClient();
     const { data: row, error: insertError } = await supabase
       .from(VEHICLE_DOCUMENTS_TABLE)
       .insert({

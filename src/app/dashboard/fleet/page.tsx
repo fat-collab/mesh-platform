@@ -22,9 +22,11 @@ import {
   removeVehicle,
   returnVehicle,
   setVehicleStatus,
+  uploadLoanDriverDocument,
   type RentalHandoverRequirements,
   type RentalLoanDriverRecord,
 } from '@/lib/rental-db';
+import { genUuid } from '@/lib/storage-upload';
 import type { RentalStatus, RentalVehicle } from '@/components/sales/types';
 
 const STATUS_TONE: Record<RentalStatus, string> = {
@@ -54,8 +56,8 @@ export default function FleetPage() {
   const [loanDriver, setLoanDriver] = useState<RentalLoanDriverRecord | null>(null);
   const [rentalAgreementSignatureUrl, setRentalAgreementSignatureUrl] = useState<string | null>(null);
   const [newDriverName, setNewDriverName] = useState('');
-  const [newLicenseFile, setNewLicenseFile] = useState<{ fileName: string; url: string } | null>(null);
-  const [newInsuranceFile, setNewInsuranceFile] = useState<{ fileName: string; url: string } | null>(
+  const [newLicenseFile, setNewLicenseFile] = useState<{ fileName: string; file: File } | null>(null);
+  const [newInsuranceFile, setNewInsuranceFile] = useState<{ fileName: string; file: File } | null>(
     null,
   );
   const [newLicenseNumber, setNewLicenseNumber] = useState('');
@@ -209,12 +211,18 @@ export default function FleetPage() {
     if (v.currentStatus === 'RESERVED' && hasNewCapture) {
       const attestedBy = assignAgent.trim() || 'Rep';
       const nowIso = new Date().toISOString();
+      const loanDriverId = genUuid();
+      const [licensePath, insurancePath] = await Promise.all([
+        newLicenseFile ? uploadLoanDriverDocument(loanDriverId, newLicenseFile.file, 'license') : null,
+        newInsuranceFile ? uploadLoanDriverDocument(loanDriverId, newInsuranceFile.file, 'insurance') : null,
+      ]);
       await addRentalLoanDriver({
+        id: loanDriverId,
         rentalVehicleId: v.id,
         leadId: v.assignedLeadId,
         driverName: newDriverName.trim() || loanDriver?.driverName || assignCustomer.trim() || 'Unknown driver',
-        licenseDocumentUrl: newLicenseFile?.url ?? loanDriver?.licenseDocumentUrl ?? null,
-        insuranceDocumentUrl: newInsuranceFile?.url ?? loanDriver?.insuranceDocumentUrl ?? null,
+        licenseDocumentUrl: licensePath ?? loanDriver?.licenseDocumentUrl ?? null,
+        insuranceDocumentUrl: insurancePath ?? loanDriver?.insuranceDocumentUrl ?? null,
         licenseNumber: newLicenseNumber.trim() || null,
         licenseExpiry: newLicenseExpiry || null,
         insuranceCarrier: newInsuranceCarrier.trim() || null,
@@ -436,8 +444,8 @@ interface FleetRowProps {
   loanDriver: RentalLoanDriverRecord | null;
   rentalAgreementSignatureUrl: string | null;
   newDriverName: string;
-  newLicenseFile: { fileName: string; url: string } | null;
-  newInsuranceFile: { fileName: string; url: string } | null;
+  newLicenseFile: { fileName: string; file: File } | null;
+  newInsuranceFile: { fileName: string; file: File } | null;
   newLicenseNumber: string;
   newLicenseExpiry: string;
   newInsuranceCarrier: string;
@@ -448,8 +456,8 @@ interface FleetRowProps {
   rentalAgreementAttested: boolean;
   handoverAllowed: boolean;
   onNewDriverName: (v: string) => void;
-  onNewLicenseFile: (f: { fileName: string; url: string } | null) => void;
-  onNewInsuranceFile: (f: { fileName: string; url: string } | null) => void;
+  onNewLicenseFile: (f: { fileName: string; file: File } | null) => void;
+  onNewInsuranceFile: (f: { fileName: string; file: File } | null) => void;
   onNewLicenseNumber: (v: string) => void;
   onNewLicenseExpiry: (v: string) => void;
   onNewInsuranceCarrier: (v: string) => void;
@@ -700,26 +708,28 @@ function FleetRow({
                       </span>
                     </span>
                     {handoverRequirements.driversLicense === 'DOCUMENT' ? (
-                      loanDriver?.licenseDocumentUrl && !newLicenseFile ? (
-                        <span className="block text-[11px] text-emerald-300">✓ Already on file</span>
-                      ) : (
-                        <>
-                          <input
-                            type="file"
-                            accept="image/*"
-                            onChange={(e) => {
-                              const f = e.target.files?.[0];
-                              if (f) onNewLicenseFile({ fileName: f.name, url: URL.createObjectURL(f) });
-                            }}
-                            className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
-                          />
-                          {newLicenseFile && (
-                            <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
-                              ✓ {newLicenseFile.fileName}
-                            </span>
-                          )}
-                        </>
-                      )
+                      <>
+                        {loanDriver?.licenseDocumentUrl && !newLicenseFile && (
+                          <span className="block text-[11px] text-emerald-300">
+                            ✓ Already on file — upload below to replace it
+                          </span>
+                        )}
+                        <input
+                          type="file"
+                          accept="image/*"
+                          onChange={(e) => {
+                            const f = e.target.files?.[0];
+                            if (f) onNewLicenseFile({ fileName: f.name, file: f });
+                          }}
+                          className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
+                        />
+                        {newLicenseFile && (
+                          <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
+                            ✓ {newLicenseFile.fileName}
+                            {loanDriver?.licenseDocumentUrl ? ' (replacing document on file)' : ''}
+                          </span>
+                        )}
+                      </>
                     ) : (
                       <>
                         <div className="grid grid-cols-2 gap-1.5">
@@ -760,26 +770,28 @@ function FleetRow({
                       </span>
                     </span>
                     {handoverRequirements.driverInsurance === 'DOCUMENT' ? (
-                      loanDriver?.insuranceDocumentUrl && !newInsuranceFile ? (
-                        <span className="block text-[11px] text-emerald-300">✓ Already on file</span>
-                      ) : (
-                        <>
-                          <input
-                            type="file"
-                            accept="image/*"
-                            onChange={(e) => {
-                              const f = e.target.files?.[0];
-                              if (f) onNewInsuranceFile({ fileName: f.name, url: URL.createObjectURL(f) });
-                            }}
-                            className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
-                          />
-                          {newInsuranceFile && (
-                            <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
-                              ✓ {newInsuranceFile.fileName}
-                            </span>
-                          )}
-                        </>
-                      )
+                      <>
+                        {loanDriver?.insuranceDocumentUrl && !newInsuranceFile && (
+                          <span className="block text-[11px] text-emerald-300">
+                            ✓ Already on file — upload below to replace it
+                          </span>
+                        )}
+                        <input
+                          type="file"
+                          accept="image/*"
+                          onChange={(e) => {
+                            const f = e.target.files?.[0];
+                            if (f) onNewInsuranceFile({ fileName: f.name, file: f });
+                          }}
+                          className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
+                        />
+                        {newInsuranceFile && (
+                          <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
+                            ✓ {newInsuranceFile.fileName}
+                            {loanDriver?.insuranceDocumentUrl ? ' (replacing document on file)' : ''}
+                          </span>
+                        )}
+                      </>
                     ) : (
                       <>
                         <input

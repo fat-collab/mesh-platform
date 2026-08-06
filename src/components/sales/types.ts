@@ -243,8 +243,6 @@ export interface RentalAssignmentInfo {
   /** Who actually took the keys — may differ from the AOB signer (the
    *  Named Insured or their proxy). Captured separately per loan event. */
   driverName: string;
-  driverLicenseDocUrl?: string | null;
-  driverInsuranceDocUrl?: string | null;
 }
 
 // ---------------------------------------------------------------------------

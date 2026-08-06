@@ -21,10 +21,12 @@ import {
   getAvailableVehicles,
   getRentalHandoverRequirements,
   isHandoverItemSatisfied,
+  uploadLoanDriverDocument,
   type RentalHandoverRequirements,
 } from '@/lib/rental-db';
 import { getCurrentProfile } from '@/lib/auth';
 import { getSupabaseBrowserClient } from '@/lib/supabase';
+import { genUuid } from '@/lib/storage-upload';
 import { CarrierTierBadge } from '@/components/carrier/CarrierTierBadge';
 import { getCarrierIntel, CHECKLIST_ITEM_LABEL, type ChecklistItemId } from '@/lib/carrier-intel';
 import { resolveRentalOperator, type RentalOperatorBinding } from '@/lib/agreement-engine';
@@ -485,8 +487,6 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
               preDamageNotes: loanerPreDamage.trim(),
               expectedReturnDate,
               driverName: driverName.trim() || rentalOperator.name || 'Unknown driver',
-              driverLicenseDocUrl: driverLicenseFile?.previewUrl ?? null,
-              driverInsuranceDocUrl: driverInsuranceFile?.previewUrl ?? null,
             }
           : null;
 
@@ -571,12 +571,20 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
         // throws, so it can't block the rest of submit.
         const attestedBy = assignedStaffName.trim() || 'Rep';
         const nowIso = new Date().toISOString();
+        const loanDriverId = genUuid();
+        const [licensePath, insurancePath] = await Promise.all([
+          driverLicenseFile ? uploadLoanDriverDocument(loanDriverId, driverLicenseFile.file, 'license') : null,
+          driverInsuranceFile
+            ? uploadLoanDriverDocument(loanDriverId, driverInsuranceFile.file, 'insurance')
+            : null,
+        ]);
         await addRentalLoanDriver({
+          id: loanDriverId,
           rentalVehicleId: rental.vehicleId,
           leadId: lead.id,
           driverName: rental.driverName,
-          licenseDocumentUrl: rental.driverLicenseDocUrl,
-          insuranceDocumentUrl: rental.driverInsuranceDocUrl,
+          licenseDocumentUrl: licensePath,
+          insuranceDocumentUrl: insurancePath,
           licenseNumber: driverLicenseNumber.trim() || null,
           licenseExpiry: driverLicenseExpiry || null,
           insuranceCarrier: driverInsuranceCarrier.trim() || null,

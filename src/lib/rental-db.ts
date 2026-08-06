@@ -11,6 +11,7 @@ import { executeDBOperation } from './db-guard';
 import { getCurrentProfile } from './auth';
 import { MOCK_FLEET } from './rental-mock';
 import { reserveVehicleForLead } from '@/app/actions/fleet-reservation';
+import { assertPersistableDocumentUrl, genUuid, uploadDocumentFile } from '@/lib/storage-upload';
 import type { RentalStatus, RentalVehicle } from '@/components/sales/types';
 
 const FLEET_TABLE = 'rental_vehicles';
@@ -267,6 +268,12 @@ export async function returnVehicle(vehicleId: string, input: ReturnVehicleInput
 const LOAN_DRIVERS_TABLE = 'rental_loan_drivers';
 
 export interface AddRentalLoanDriverInput {
+  // Generated client-side via genUuid() before the insert, not left to the
+  // column's default — the license/insurance Storage path
+  // ({org}/fleet/{loan_driver_id}/...) needs this row's id before the row
+  // exists, so the caller mints it first and uploads with it (see
+  // uploadLoanDriverDocument below) before ever calling this function.
+  id: string;
   rentalVehicleId: string;
   leadId?: string | null;
   driverName: string;
@@ -382,14 +389,54 @@ function localToRecord(local: LocalLoanDriver): RentalLoanDriverRecord {
 }
 
 /**
+ * Compresses + uploads a loan driver's license/insurance photo to the
+ * 'documents' bucket, at the {org}/fleet/{loan_driver_id}/{docType}-{uuid}
+ * path segment the Storage migration already reserved for it. Returns the
+ * resulting path, or null on failure — never throws, matching every other
+ * write in this file (a failed document photo must not block key release
+ * from completing for reasons unrelated to the handover gate itself).
+ *
+ * Resolves the org client-side rather than taking it as a param:
+ * rental_vehicles/rental_loan_drivers have no organization_id column of
+ * their own (still on permissive RLS, deliberately deferred), but the
+ * 'documents' bucket's write RLS keys off the first path segment matching
+ * the current session's org, so the path still needs one from somewhere.
+ */
+export async function uploadLoanDriverDocument(
+  loanDriverId: string,
+  file: File,
+  docType: 'license' | 'insurance',
+): Promise<string | null> {
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const profile = await getCurrentProfile(supabase);
+    if (!profile?.organizationId) return null;
+    const pathWithoutExt = `${profile.organizationId}/fleet/${loanDriverId}/${docType}-${genUuid()}`;
+    const uploaded = await uploadDocumentFile(pathWithoutExt, file);
+    return uploaded?.path ?? null;
+  } catch (err) {
+    console.warn(`[rental-db] uploadLoanDriverDocument failed for loan driver ${loanDriverId}:`, err);
+    return null;
+  }
+}
+
+/**
  * Records who actually took the keys for a loaner — may differ from the AOB
  * signer (see RentalAssignmentInfo.driverName). Best-effort, DB-first with a
  * session-local mirror, matching every other write in this file.
+ *
+ * Rejects a blob:/data: license or insurance URL outright rather than
+ * storing it — the handover gate checks these columns for "on file," so a
+ * dead URL here means a vehicle can be released against evidence that was
+ * never actually stored. See uploadLoanDriverDocument for the real path.
  */
 export async function addRentalLoanDriver(input: AddRentalLoanDriverInput): Promise<void> {
+  assertPersistableDocumentUrl(input.licenseDocumentUrl);
+  assertPersistableDocumentUrl(input.insuranceDocumentUrl);
   try {
     const supabase = getSupabaseBrowserClient();
     const { error } = await supabase.from(LOAN_DRIVERS_TABLE).insert({
+      id: input.id,
       rental_vehicle_id: input.rentalVehicleId,
       lead_id: input.leadId ?? null,
       driver_name: input.driverName,

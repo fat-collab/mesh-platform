@@ -1003,7 +1003,7 @@ export function RODetailDrawer({
                 <div className="flex items-center justify-between gap-2">
                   <input
                     type="file"
-                    accept=".json,.xml,.csv,.txt"
+                    accept=".json,.xml,.csv,.txt,.pdf,application/pdf"
                     onChange={(e) => void handleFiles(e.target.files)}
                     className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-0.5 file:text-zinc-200"
                   />

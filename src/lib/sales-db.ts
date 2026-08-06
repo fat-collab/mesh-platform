@@ -322,6 +322,53 @@ const MIME_EXT: Record<string, string> = {
   'application/pdf': 'pdf',
 };
 
+const COMPRESS_MAX_DIMENSION = 2000;
+const COMPRESS_QUALITY = 0.8;
+
+/**
+ * Downscales + re-encodes an image File before it ever reaches Storage — a
+ * driver's license photo landed at 12MB uncompressed; twenty hail-panel
+ * shots at that size is a gigabyte per vehicle, over cellular. Resizes to a
+ * ~2000px long edge (never upscales) and always re-encodes as JPEG at 80%
+ * quality, so a large lossless PNG screenshot benefits even when it's
+ * already under the size cap. Non-image files (PRIOR_ESTIMATE's
+ * json/xml/csv/txt/pdf) pass through untouched — running them through
+ * canvas would corrupt them. HEIC decode support is inconsistent outside
+ * Safari; any decode/encode failure falls back to uploading the original
+ * file rather than failing the upload — the bucket's 15MB hard limit is the
+ * real backstop either way.
+ */
+async function compressImageFile(file: File): Promise<File> {
+  if (!file.type.startsWith('image/')) return file;
+  let bitmap: ImageBitmap | null = null;
+  try {
+    bitmap = await createImageBitmap(file);
+    const scale = Math.min(1, COMPRESS_MAX_DIMENSION / Math.max(bitmap.width, bitmap.height));
+    const width = Math.round(bitmap.width * scale);
+    const height = Math.round(bitmap.height * scale);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return file;
+    ctx.drawImage(bitmap, 0, 0, width, height);
+
+    const blob: Blob | null = await new Promise((resolve) =>
+      canvas.toBlob(resolve, 'image/jpeg', COMPRESS_QUALITY),
+    );
+    if (!blob) return file;
+
+    const compressedName = `${file.name.replace(/\.[^./]+$/, '')}.jpg`;
+    return new File([blob], compressedName, { type: 'image/jpeg' });
+  } catch (err) {
+    console.warn(`[sales-db] image compression failed for ${file.name}, uploading original:`, err);
+    return file;
+  } finally {
+    bitmap?.close();
+  }
+}
+
 /**
  * Creates (or returns the existing) is_primary lead_vehicles row for a lead
  * — the anchor every document upload attaches to. Idempotent against
@@ -381,13 +428,14 @@ async function uploadVehicleDocument(
   kind: IntakeDocKind,
 ): Promise<IntakeDocumentRef | null> {
   try {
+    const uploadFile = await compressImageFile(file);
     const supabase = getSupabaseBrowserClient();
-    const ext = MIME_EXT[file.type] ?? (file.name.split('.').pop() || 'bin');
+    const ext = MIME_EXT[uploadFile.type] ?? (uploadFile.name.split('.').pop() || 'bin');
     const path = `${organizationId}/leads/${leadId}/vehicles/${leadVehicleId}/documents/${kind}-${genUuid()}.${ext}`;
 
     const { error: uploadError } = await supabase.storage
       .from(DOCUMENTS_BUCKET)
-      .upload(path, file, { contentType: file.type || undefined, upsert: false });
+      .upload(path, uploadFile, { contentType: uploadFile.type || undefined, upsert: false });
     if (uploadError) {
       console.warn(
         `[sales-db] Storage upload failed for ${kind} on lead_vehicle ${leadVehicleId}:`,
@@ -402,10 +450,10 @@ async function uploadVehicleDocument(
         organization_id: organizationId,
         lead_vehicle_id: leadVehicleId,
         kind,
-        file_name: file.name,
+        file_name: uploadFile.name,
         storage_path: path,
-        byte_size: file.size,
-        mime_type: file.type || null,
+        byte_size: uploadFile.size,
+        mime_type: uploadFile.type || null,
       })
       .select('id')
       .single();
@@ -417,12 +465,18 @@ async function uploadVehicleDocument(
       return null;
     }
 
-    return { id: (row as { id: string }).id, kind, fileName: file.name, storagePath: path };
+    return { id: (row as { id: string }).id, kind, fileName: uploadFile.name, storagePath: path };
   } catch (err) {
     console.warn(`[sales-db] uploadVehicleDocument failed for ${kind} on lead_vehicle ${leadVehicleId}:`, err);
     return null;
   }
 }
+
+// Bounded, not unbounded Promise.all — on a cellular uplink the connection
+// itself is the bottleneck, not server-side concurrency, so a handful of
+// simultaneous uploads gets most of the win without dozens of requests
+// fighting over the same pipe.
+const UPLOAD_CONCURRENCY = 4;
 
 /**
  * Uploads every pending file for a lead_vehicle, skipping (with a warning)
@@ -430,6 +484,11 @@ async function uploadVehicleDocument(
  * end with as many documents captured as possible, not zero because one
  * upload failed. Returns [] without attempting anything if leadVehicleId is
  * null (ensurePrimaryLeadVehicle failed) — there's nowhere to attach to.
+ *
+ * Runs up to UPLOAD_CONCURRENCY uploads at once via a small worker pool
+ * rather than one at a time — uploadVehicleDocument already never throws
+ * (returns null and logs on failure), so a worker just moves on to the next
+ * file; nothing here needs its own try/catch to preserve that semantics.
  */
 async function uploadPendingDocuments(
   leadVehicleId: string | null,
@@ -439,10 +498,16 @@ async function uploadPendingDocuments(
 ): Promise<IntakeDocumentRef[]> {
   if (!leadVehicleId || pending.length === 0) return [];
   const uploaded: IntakeDocumentRef[] = [];
-  for (const doc of pending) {
-    const ref = await uploadVehicleDocument(leadVehicleId, organizationId, leadId, doc.file, doc.kind);
-    if (ref) uploaded.push(ref);
-  }
+  let next = 0;
+  const worker = async () => {
+    while (next < pending.length) {
+      const doc = pending[next++];
+      const ref = await uploadVehicleDocument(leadVehicleId, organizationId, leadId, doc.file, doc.kind);
+      if (ref) uploaded.push(ref);
+    }
+  };
+  const workerCount = Math.min(UPLOAD_CONCURRENCY, pending.length);
+  await Promise.all(Array.from({ length: workerCount }, worker));
   return uploaded;
 }
 

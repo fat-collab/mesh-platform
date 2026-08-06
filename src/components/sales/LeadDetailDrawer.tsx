@@ -52,6 +52,19 @@ const GENERAL_DOC_LABEL: Record<string, string> = {
   DAMAGE_PHOTO: 'Damage Photo',
 };
 
+// Kinds a hail job needs many of — vehicle_documents already supports
+// multiple rows per kind, so these get an append-only, multi-select slot
+// instead of the replace-on-reupload single slot every other kind uses.
+const MULTI_DOC_KINDS: IntakeDocKind[] = ['FOUR_CORNER_PHOTOS', 'DAMAGE_PHOTO', 'WALKAROUND'];
+
+// Per-kind file picker filter — everything defaults to photo capture except
+// the estimate, which arrives as a document (json/xml/csv/txt exports, or a
+// scanned/printed PDF carrier sheet).
+const DOC_ACCEPT: Partial<Record<IntakeDocKind, string>> = {
+  PRIOR_ESTIMATE: '.json,.xml,.csv,.txt,.pdf,application/pdf',
+};
+const DEFAULT_DOC_ACCEPT = 'image/*';
+
 interface LeadDetailDrawerProps {
   lead: IntakeLead;
   onClose: () => void;
@@ -124,18 +137,27 @@ export function LeadDetailDrawer({ lead, onClose, onSaved }: LeadDetailDrawerPro
     }
   };
 
-  const handleUpload = async (kind: IntakeDocKind, file: File | undefined) => {
-    if (!file) return;
+  const handleUpload = async (kind: IntakeDocKind, files: FileList | null) => {
+    if (!files || files.length === 0) return;
     setUploadingKind(kind);
     setError(null);
     try {
-      const existing = documents.find((d) => d.kind === kind);
-      if (existing?.id) {
-        await removeVehicleDocument(existing.id);
+      const isMulti = MULTI_DOC_KINDS.includes(kind);
+      // Single-slot kinds replace what's there; multi kinds only ever append
+      // — vehicle_documents already supports many rows per kind, this is
+      // just choosing which UI behavior to expose per kind.
+      if (!isMulti) {
+        for (const doc of documents.filter((d) => d.kind === kind)) {
+          if (doc.id) await removeVehicleDocument(doc.id);
+        }
       }
-      const ref = await addVehicleDocument(lead.id, file, kind);
-      if (!ref) throw new Error('Upload failed.');
-      setDocuments((prev) => [...prev.filter((d) => d.kind !== kind), ref]);
+      const uploaded: IntakeDocumentRef[] = [];
+      for (const file of Array.from(files)) {
+        const ref = await addVehicleDocument(lead.id, file, kind);
+        if (ref) uploaded.push(ref);
+      }
+      if (uploaded.length === 0) throw new Error('Upload failed.');
+      setDocuments((prev) => [...(isMulti ? prev : prev.filter((d) => d.kind !== kind)), ...uploaded]);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save the document.');
     } finally {
@@ -143,15 +165,13 @@ export function LeadDetailDrawer({ lead, onClose, onSaved }: LeadDetailDrawerPro
     }
   };
 
-  const handleRemove = async (kind: IntakeDocKind) => {
+  const handleRemove = async (kind: IntakeDocKind, documentId: string | undefined) => {
+    if (!documentId) return;
     setUploadingKind(kind);
     setError(null);
     try {
-      const existing = documents.find((d) => d.kind === kind);
-      if (existing?.id) {
-        await removeVehicleDocument(existing.id);
-      }
-      setDocuments((prev) => prev.filter((d) => d.kind !== kind));
+      await removeVehicleDocument(documentId);
+      setDocuments((prev) => prev.filter((d) => d.id !== documentId));
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to remove the document.');
     } finally {
@@ -212,38 +232,46 @@ export function LeadDetailDrawer({ lead, onClose, onSaved }: LeadDetailDrawerPro
   // language so the gating status stays visually distinct: red/amber only
   // ever appears for checklist items; general items use neutral zinc.
   function renderDocSlot(kind: IntakeDocKind, label: string, gating: boolean) {
-    const captured = documents.find((d) => d.kind === kind);
+    const captured = documents.filter((d) => d.kind === kind);
+    const isMulti = MULTI_DOC_KINDS.includes(kind);
     const busy = uploadingKind === kind;
     return (
       <div key={kind} className="rounded-md border border-zinc-700 bg-zinc-800/60 p-2">
         <div className="mb-1 flex items-center justify-between gap-2">
           <span className="text-[11px] font-semibold text-zinc-300">{label}</span>
-          {captured ? (
-            <span className="text-[11px] font-semibold text-emerald-300">✓ Captured</span>
+          {captured.length > 0 ? (
+            <span className="text-[11px] font-semibold text-emerald-300">
+              ✓ Captured{isMulti && captured.length > 1 ? ` (${captured.length})` : ''}
+            </span>
           ) : gating ? (
             <span className="text-[11px] font-semibold text-red-300">✗ Missing</span>
           ) : (
             <span className="text-[11px] font-medium text-zinc-500">— Not captured</span>
           )}
         </div>
-        {captured && (
-          <div className="mb-1 flex items-center justify-between gap-2">
-            <p className="truncate text-[11px] text-zinc-500">{captured.fileName}</p>
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => void handleRemove(kind)}
-              className="shrink-0 text-[11px] font-semibold text-red-400 hover:text-red-300 disabled:opacity-40"
-            >
-              ✕ Remove
-            </button>
+        {captured.length > 0 && (
+          <div className="mb-1 space-y-1">
+            {captured.map((doc) => (
+              <div key={doc.id ?? doc.storagePath} className="flex items-center justify-between gap-2">
+                <p className="truncate text-[11px] text-zinc-500">{doc.fileName}</p>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void handleRemove(kind, doc.id)}
+                  className="shrink-0 text-[11px] font-semibold text-red-400 hover:text-red-300 disabled:opacity-40"
+                >
+                  ✕ Remove
+                </button>
+              </div>
+            ))}
           </div>
         )}
         <input
           type="file"
-          accept="image/*"
+          accept={DOC_ACCEPT[kind] ?? DEFAULT_DOC_ACCEPT}
+          multiple={isMulti}
           disabled={busy}
-          onChange={(e) => void handleUpload(kind, e.target.files?.[0])}
+          onChange={(e) => void handleUpload(kind, e.target.files)}
           className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
         />
       </div>

@@ -147,6 +147,10 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
     FOUR_CORNER_PHOTOS: null,
     UNDERSIDE_BRACING_SHOTS: null,
   });
+  // FOUR_CORNER_PHOTOS never writes into `docs` above — a hail job needs many
+  // corner shots, not one, so it gets its own append-many array, same
+  // pattern as walkaroundPhotos below. `docs.FOUR_CORNER_PHOTOS` stays null.
+  const [fourCornerPhotos, setFourCornerPhotos] = useState<LocalDoc[]>([]);
   const [parsedItems, setParsedItems] = useState<PartsLineItem[]>([]);
   const [parseMsg, setParseMsg] = useState<string | null>(null);
 
@@ -321,6 +325,25 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
     }));
   };
 
+  // "Captured" for gating/summary purposes — true whenever at least one
+  // document of this kind exists, whether that's docs' single slot or
+  // FOUR_CORNER_PHOTOS' array.
+  const isDocCaptured = (kind: IntakeDocKind) =>
+    kind === 'FOUR_CORNER_PHOTOS' ? fourCornerPhotos.length > 0 : Boolean(docs[kind]);
+
+  const addFourCornerPhotos = (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const added: LocalDoc[] = Array.from(files).map((f) => ({
+      kind: 'FOUR_CORNER_PHOTOS',
+      file: f,
+      fileName: f.name,
+      previewUrl: URL.createObjectURL(f),
+    }));
+    setFourCornerPhotos((prev) => [...prev, ...added]);
+  };
+  const removeFourCornerPhoto = (previewUrl: string | null | undefined) =>
+    setFourCornerPhotos((prev) => prev.filter((p) => p.previewUrl !== previewUrl));
+
   const onEstimateFile = async (file: File | undefined) => {
     if (!file) return;
     setDoc('PRIOR_ESTIMATE', file);
@@ -439,7 +462,7 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
       const pendingDocuments: PendingVehicleDocument[] = (Object.keys(docs) as IntakeDocKind[])
         .map((k) => docs[k])
         .filter((d): d is LocalDoc => d !== null)
-        .concat(walkaroundPhotos)
+        .concat(walkaroundPhotos, fourCornerPhotos)
         .map(({ kind, file, fileName }) => ({ kind, file, fileName }));
       const hailMatrix: HailPanelAssessment[] = HAIL_PANELS.map((panel) => ({
         panel,
@@ -825,7 +848,7 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                 </span>
                 <input
                   type="file"
-                  accept=".json,.xml,.csv,.txt"
+                  accept=".json,.xml,.csv,.txt,.pdf,application/pdf"
                   onChange={(e) => void onEstimateFile(e.target.files?.[0])}
                   className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
                 />
@@ -856,35 +879,73 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                     {insuranceCarrier || 'This carrier'} flags claims for scrutiny — capture these
                     when possible.
                   </p>
-                  {carrierChecklist.some((kind) => !docs[kind]) && (
+                  {carrierChecklist.some((kind) => !isDocCaptured(kind)) && (
                     <p className="rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1.5 text-[11px] text-red-200">
                       ⚠ Missing: {carrierChecklist
-                        .filter((kind) => !docs[kind])
+                        .filter((kind) => !isDocCaptured(kind))
                         .map((kind) => CHECKLIST_ITEM_LABEL[kind])
                         .join(', ')}
                       . The lead can still be saved, but the repair order cannot be opened until
                       these are captured.
                     </p>
                   )}
-                  {carrierChecklist.map((kind) => (
-                    <label key={kind} className="block">
-                      <span className="mb-1 block font-mono text-[11px] uppercase tracking-wider text-zinc-500">
-                        {CHECKLIST_ITEM_LABEL[kind]} <span className="text-red-400">*</span>
-                      </span>
-                      <input
-                        type="file"
-                        accept="image/*"
-                        capture="environment"
-                        onChange={(e) => setDoc(kind, e.target.files?.[0])}
-                        className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
-                      />
-                      {docs[kind] && (
-                        <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
-                          ✓ {docs[kind]?.fileName}
+                  {carrierChecklist.map((kind) =>
+                    kind === 'FOUR_CORNER_PHOTOS' ? (
+                      <label key={kind} className="block">
+                        <span className="mb-1 block font-mono text-[11px] uppercase tracking-wider text-zinc-500">
+                          {CHECKLIST_ITEM_LABEL[kind]} <span className="text-red-400">*</span>
                         </span>
-                      )}
-                    </label>
-                  ))}
+                        <input
+                          type="file"
+                          accept="image/*"
+                          capture="environment"
+                          multiple
+                          onChange={(e) => addFourCornerPhotos(e.target.files)}
+                          className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
+                        />
+                        {fourCornerPhotos.length > 0 && (
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            {fourCornerPhotos.map((p, i) => (
+                              <div key={i} className="relative">
+                                {/* eslint-disable-next-line @next/next/no-img-element */}
+                                <img
+                                  src={p.previewUrl}
+                                  alt={p.fileName}
+                                  className="h-14 w-14 rounded border border-zinc-700 object-cover"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => removeFourCornerPhoto(p.previewUrl)}
+                                  aria-label="Remove photo"
+                                  className="absolute -right-1 -top-1 rounded-full bg-zinc-800 px-1 text-[10px] font-bold text-red-300"
+                                >
+                                  ×
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </label>
+                    ) : (
+                      <label key={kind} className="block">
+                        <span className="mb-1 block font-mono text-[11px] uppercase tracking-wider text-zinc-500">
+                          {CHECKLIST_ITEM_LABEL[kind]} <span className="text-red-400">*</span>
+                        </span>
+                        <input
+                          type="file"
+                          accept="image/*"
+                          capture="environment"
+                          onChange={(e) => setDoc(kind, e.target.files?.[0])}
+                          className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-zinc-200"
+                        />
+                        {docs[kind] && (
+                          <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
+                            ✓ {docs[kind]?.fileName}
+                          </span>
+                        )}
+                      </label>
+                    ),
+                  )}
                 </div>
               )}
             </>
@@ -1344,7 +1405,13 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
               <dl className="space-y-1 rounded-md border border-zinc-800 bg-zinc-950/60 p-3">
                 <Row label="Carrier / Claim" value={`${insuranceCarrier || '—'}${claimNumber ? ` · ${claimNumber}` : ''}`} />
                 <Row label="Est. amount" value={estimatedAmount ? `$${estimatedAmount}` : '—'} />
-                <Row label="Documents" value={`${(Object.keys(docs) as IntakeDocKind[]).filter((k) => docs[k]).length} captured`} />
+                <Row
+                  label="Documents"
+                  value={`${
+                    (Object.keys(docs) as IntakeDocKind[]).filter((k) => docs[k]).length +
+                    (fourCornerPhotos.length > 0 ? 1 : 0)
+                  } captured`}
+                />
                 <Row label="Hail panels flagged" value={`${flaggedHail}/${HAIL_PANELS.length}`} />
                 <Row label="Parsed estimate lines" value={String(parsedItems.length)} />
                 <Row
@@ -1362,7 +1429,7 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                 {carrierChecklist.length > 0 && (
                   <Row
                     label="Carrier checklist"
-                    value={`${carrierChecklist.filter((k) => docs[k]).length}/${carrierChecklist.length} captured`}
+                    value={`${carrierChecklist.filter((k) => isDocCaptured(k)).length}/${carrierChecklist.length} captured`}
                   />
                 )}
                 {!policyholderMatch && <Row label="Remote AOB" value="Will dispatch on submit" />}

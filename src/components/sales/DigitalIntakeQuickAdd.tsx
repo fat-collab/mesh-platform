@@ -66,8 +66,11 @@ export function DigitalIntakeQuickAdd({ onClose, onComplete }: DigitalIntakeQuic
   const [severity, setSeverity] = useState<StormSeverity>('MODERATE');
   const [photos, setPhotos] = useState<PendingVehicleDocument[]>([]);
 
-  // Document Vault (mandatory intake grid)
+  // Document Vault (mandatory intake grid). FOUR_CORNER_PHOTOS lives outside
+  // vaultDocs' single-slot map — a hail job needs many corner shots, not one
+  // — same append-many pattern as `photos` above.
   const [vaultDocs, setVaultDocs] = useState<Partial<Record<IntakeDocKind, PendingVehicleDocument>>>({});
+  const [fourCornerPhotos, setFourCornerPhotos] = useState<PendingVehicleDocument[]>([]);
   const [parsedItems, setParsedItems] = useState<PartsLineItem[]>([]);
   const [parseMsg, setParseMsg] = useState<string | null>(null);
 
@@ -99,6 +102,18 @@ export function DigitalIntakeQuickAdd({ onClose, onComplete }: DigitalIntakeQuic
     setVaultDocs((prev) => ({ ...prev, [kind]: { kind, file, fileName: file.name } }));
   };
 
+  const addFourCornerPhotos = (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const refs: PendingVehicleDocument[] = Array.from(files).map((file) => ({
+      kind: 'FOUR_CORNER_PHOTOS',
+      file,
+      fileName: file.name,
+    }));
+    setFourCornerPhotos((prev) => [...prev, ...refs]);
+  };
+  const removeFourCornerPhoto = (index: number) =>
+    setFourCornerPhotos((prev) => prev.filter((_, i) => i !== index));
+
   const onEstimateFile = async (file: File | undefined) => {
     if (!file) return;
     setVaultDocs((prev) => ({ ...prev, PRIOR_ESTIMATE: { kind: 'PRIOR_ESTIMATE', file, fileName: file.name } }));
@@ -121,7 +136,9 @@ export function DigitalIntakeQuickAdd({ onClose, onComplete }: DigitalIntakeQuic
   // Driver's License, Insurance Card, and Prior Estimate are optional — a
   // rep can push the lead forward instantly and fill them in later. The
   // dynamic carrier-risk checklist stays mandatory (compliance gate).
-  const checklistComplete = carrierChecklist.every((kind) => Boolean(vaultDocs[kind]));
+  const checklistComplete = carrierChecklist.every((kind) =>
+    kind === 'FOUR_CORNER_PHOTOS' ? fourCornerPhotos.length > 0 : Boolean(vaultDocs[kind]),
+  );
   const proxyComplete = policyholderMatch || proxyFullName.trim() !== '';
   const canSubmit = customerName.trim() !== '' && checklistComplete && proxyComplete;
 
@@ -142,7 +159,7 @@ export function DigitalIntakeQuickAdd({ onClose, onComplete }: DigitalIntakeQuic
     setSubmitting(true);
     setError(null);
     try {
-      const documents: PendingVehicleDocument[] = [...Object.values(vaultDocs), ...photos];
+      const documents: PendingVehicleDocument[] = [...Object.values(vaultDocs), ...photos, ...fourCornerPhotos];
       const proxyPolicyholder: ProxyPolicyholder | null = policyholderMatch
         ? null
         : {
@@ -403,7 +420,7 @@ export function DigitalIntakeQuickAdd({ onClose, onComplete }: DigitalIntakeQuic
               <span className={labelCls}>Initial Insurance Estimate</span>
               <input
                 type="file"
-                accept=".json,.xml,.csv,.txt"
+                accept=".json,.xml,.csv,.txt,.pdf,application/pdf"
                 onChange={(e) => void onEstimateFile(e.target.files?.[0])}
                 className={fileCls}
               />
@@ -429,24 +446,58 @@ export function DigitalIntakeQuickAdd({ onClose, onComplete }: DigitalIntakeQuic
                 {insuranceCarrier || 'This carrier'} flags claims for scrutiny — capture these before
                 proceeding.
               </p>
-              {carrierChecklist.map((kind) => (
-                <label key={kind} className="block">
-                  <span className={labelCls}>
-                    {CHECKLIST_ITEM_LABEL[kind]} <span className="text-red-400">*</span>
-                  </span>
-                  <input
-                    type="file"
-                    accept="image/*"
-                    onChange={(e) => void setVaultDoc(kind, e.target.files?.[0])}
-                    className={fileCls}
-                  />
-                  {vaultDocs[kind] && (
-                    <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
-                      ✓ {vaultDocs[kind]?.fileName}
+              {carrierChecklist.map((kind) =>
+                kind === 'FOUR_CORNER_PHOTOS' ? (
+                  <label key={kind} className="block">
+                    <span className={labelCls}>
+                      {CHECKLIST_ITEM_LABEL[kind]} <span className="text-red-400">*</span>
                     </span>
-                  )}
-                </label>
-              ))}
+                    <input
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      onChange={(e) => void addFourCornerPhotos(e.target.files)}
+                      className={fileCls}
+                    />
+                    {fourCornerPhotos.length > 0 && (
+                      <ul className="mt-0.5 space-y-0.5">
+                        {fourCornerPhotos.map((doc, i) => (
+                          <li
+                            key={i}
+                            className="flex items-center justify-between gap-2 text-[11px] text-emerald-300"
+                          >
+                            <span className="truncate">✓ {doc.fileName}</span>
+                            <button
+                              type="button"
+                              onClick={() => removeFourCornerPhoto(i)}
+                              className="shrink-0 font-semibold text-red-400 hover:text-red-300"
+                            >
+                              ✕
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </label>
+                ) : (
+                  <label key={kind} className="block">
+                    <span className={labelCls}>
+                      {CHECKLIST_ITEM_LABEL[kind]} <span className="text-red-400">*</span>
+                    </span>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      onChange={(e) => void setVaultDoc(kind, e.target.files?.[0])}
+                      className={fileCls}
+                    />
+                    {vaultDocs[kind] && (
+                      <span className="mt-0.5 block truncate text-[11px] text-emerald-300">
+                        ✓ {vaultDocs[kind]?.fileName}
+                      </span>
+                    )}
+                  </label>
+                ),
+              )}
             </div>
           )}
 

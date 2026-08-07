@@ -101,7 +101,14 @@ export interface AssignVehicleInput {
   expectedReturnDate?: string | null;
 }
 
-/** Assigns a loaner to a customer/lead/agent and marks it RENTED. */
+/**
+ * Assigns a loaner to a customer/lead/agent and marks it RENTED. This is
+ * the one place both the wizard's own successful-handover path and Fleet's
+ * confirmAssign funnel through, so it's also where a lead's
+ * loaner_requested_unfulfilled flag gets cleared — the vehicle actually
+ * being RENTED (not just RESERVED) is what "fulfilled" means; reserving
+ * alone leaves the flag set.
+ */
 export async function assignVehicle(vehicleId: string, input: AssignVehicleInput): Promise<void> {
   const patch: Partial<RentalVehicle> = {
     currentStatus: 'RENTED',
@@ -129,11 +136,31 @@ export async function assignVehicle(vehicleId: string, input: AssignVehicleInput
       })
       .eq('id', vehicleId)
       .select('id');
-    if (!error && data && data.length > 0) return;
+    if (!error && data && data.length > 0) {
+      if (input.leadId) await clearLoanerRequestedUnfulfilled(supabase, input.leadId);
+      return;
+    }
   } catch {
     /* fall through to local */
   }
   patchLocal(vehicleId, patch);
+}
+
+/**
+ * Best-effort clear of intake_leads.loaner_requested_unfulfilled — never
+ * throws, matching every other write in this file. A failure here just
+ * means the flag stays set a little longer, not that the vehicle
+ * assignment (already committed above) rolls back.
+ */
+async function clearLoanerRequestedUnfulfilled(
+  supabase: ReturnType<typeof getSupabaseBrowserClient>,
+  leadId: string,
+): Promise<void> {
+  try {
+    await supabase.from('intake_leads').update({ loaner_requested_unfulfilled: false }).eq('id', leadId);
+  } catch (err) {
+    console.warn(`[rental-db] failed to clear loaner_requested_unfulfilled for lead ${leadId}:`, err);
+  }
 }
 
 /**

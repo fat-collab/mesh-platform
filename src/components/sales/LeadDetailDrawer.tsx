@@ -16,6 +16,8 @@ import {
   addVehicleDocument,
   removeVehicleDocument,
   assignLeadStaff,
+  getPrimaryLeadVehicleId,
+  listVehicleDocuments,
   type LeadDetailsPatch,
 } from '@/lib/sales-db';
 import { getCurrentProfile } from '@/lib/auth';
@@ -65,6 +67,16 @@ const DOC_ACCEPT: Partial<Record<IntakeDocKind, string>> = {
 };
 const DEFAULT_DOC_ACCEPT = 'image/*';
 
+// No signed-URL helper exists yet, so a captured document's size is the only
+// useful thing to show besides its name — null renders nothing rather than
+// a misleading "0 B" for a legacy row inserted before byte_size was tracked.
+function formatBytes(bytes: number | null | undefined): string | null {
+  if (bytes == null) return null;
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 interface LeadDetailDrawerProps {
   lead: IntakeLead;
   onClose: () => void;
@@ -90,6 +102,7 @@ export function LeadDetailDrawer({ lead, onClose, onSaved }: LeadDetailDrawerPro
   );
 
   const [documents, setDocuments] = useState<IntakeDocumentRef[]>(lead.documents ?? []);
+  const [documentsLoading, setDocumentsLoading] = useState(true);
   const [ownerName, setOwnerName] = useState(lead.assignedStaffName ?? '');
   const [ownerEditing, setOwnerEditing] = useState(false);
   const [ownerDraft, setOwnerDraft] = useState(ownerName);
@@ -113,6 +126,30 @@ export function LeadDetailDrawer({ lead, onClose, onSaved }: LeadDetailDrawerPro
       cancelled = true;
     };
   }, []);
+
+  // lead.documents is always [] here — real documents live in
+  // vehicle_documents, keyed by lead_vehicle_id, not the lead itself. This
+  // was the missing read half of the Storage migration: uploads already
+  // went through addVehicleDocument/vehicle_documents, but nothing ever
+  // fetched them back for display. Read-only lookup (getPrimaryLeadVehicleId,
+  // not ensurePrimaryLeadVehicle) — opening a lead to view it must never
+  // have the side effect of creating a lead_vehicle row.
+  useEffect(() => {
+    let cancelled = false;
+    setDocumentsLoading(true);
+    void (async () => {
+      try {
+        const leadVehicleId = await getPrimaryLeadVehicleId(lead.id);
+        const docs = leadVehicleId ? await listVehicleDocuments(leadVehicleId) : [];
+        if (!cancelled) setDocuments(docs);
+      } finally {
+        if (!cancelled) setDocumentsLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [lead.id]);
 
   const canReassignOwner = role === 'MANAGER' || role === 'EXECUTIVE';
 
@@ -253,7 +290,10 @@ export function LeadDetailDrawer({ lead, onClose, onSaved }: LeadDetailDrawerPro
           <div className="mb-1 space-y-1">
             {captured.map((doc) => (
               <div key={doc.id ?? doc.storagePath} className="flex items-center justify-between gap-2">
-                <p className="truncate text-[11px] text-zinc-500">{doc.fileName}</p>
+                <p className="truncate text-[11px] text-zinc-500">
+                  {doc.fileName}
+                  {formatBytes(doc.byteSize) ? ` · ${formatBytes(doc.byteSize)}` : ''}
+                </p>
                 <button
                   type="button"
                   disabled={busy}
@@ -442,34 +482,48 @@ export function LeadDetailDrawer({ lead, onClose, onSaved }: LeadDetailDrawerPro
             />
           </div>
 
-          {/* --- Carrier-required documentation (gating) --- */}
-          {carrierChecklist.length > 0 && (
-            <div className="space-y-2 border-t border-amber-500/20 bg-amber-500/5 p-3">
-              <p className="font-mono text-[11px] uppercase tracking-wider text-amber-300">
-                Carrier-Required Documentation
+          {documentsLoading ? (
+            <p className="border-t border-zinc-800 pt-3 text-[11px] text-zinc-500">
+              Loading documents…
+            </p>
+          ) : (
+            <>
+              <p className="border-t border-zinc-800 pt-3 text-[11px] text-zinc-500">
+                Documents below show file name and size only — there's no preview or download link
+                yet.
               </p>
-              <p className="text-[11px] text-zinc-500">
-                {insuranceCarrier || 'This carrier'} flags claims for scrutiny — capture these before
-                converting to a repair order.
-              </p>
-              {carrierChecklist.map((kind) =>
-                renderDocSlot(kind, CHECKLIST_ITEM_LABEL[kind], true),
-              )}
-            </div>
-          )}
 
-          {/* --- Other documents (not gating) --- */}
-          <div className="space-y-2 border-t border-zinc-800 pt-3">
-            <p className="font-mono text-[11px] uppercase tracking-wider text-zinc-400">
-              Other Documents
-            </p>
-            <p className="text-[11px] text-zinc-500">
-              Optional — fill in whatever was missed at intake. Never blocks saving or converting.
-            </p>
-            {GENERAL_DOC_KINDS.map((kind) =>
-              renderDocSlot(kind, GENERAL_DOC_LABEL[kind], false),
-            )}
-          </div>
+              {/* --- Carrier-required documentation (gating) --- */}
+              {carrierChecklist.length > 0 && (
+                <div className="space-y-2 border-t border-amber-500/20 bg-amber-500/5 p-3">
+                  <p className="font-mono text-[11px] uppercase tracking-wider text-amber-300">
+                    Carrier-Required Documentation
+                  </p>
+                  <p className="text-[11px] text-zinc-500">
+                    {insuranceCarrier || 'This carrier'} flags claims for scrutiny — capture these
+                    before converting to a repair order.
+                  </p>
+                  {carrierChecklist.map((kind) =>
+                    renderDocSlot(kind, CHECKLIST_ITEM_LABEL[kind], true),
+                  )}
+                </div>
+              )}
+
+              {/* --- Other documents (not gating) --- */}
+              <div className="space-y-2 border-t border-zinc-800 pt-3">
+                <p className="font-mono text-[11px] uppercase tracking-wider text-zinc-400">
+                  Other Documents
+                </p>
+                <p className="text-[11px] text-zinc-500">
+                  Optional — fill in whatever was missed at intake. Never blocks saving or
+                  converting.
+                </p>
+                {GENERAL_DOC_KINDS.map((kind) =>
+                  renderDocSlot(kind, GENERAL_DOC_LABEL[kind], false),
+                )}
+              </div>
+            </>
+          )}
         </div>
 
         <div className="flex justify-end gap-3 border-t border-zinc-800 p-6 pt-4">

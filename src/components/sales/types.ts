@@ -83,6 +83,13 @@ export interface IntakeLead {
    *  vehicle at the same property. Empty/absent for the common single-vehicle
    *  case. Lazily populated; not every lead list fetch attaches this. */
   additionalVehicles?: LeadVehicle[];
+  /** True when the customer wanted a loaner but it wasn't fulfilled at
+   *  intake — no fleet vehicle was available, or one was reserved but keys
+   *  are held pending driver documents. Cleared once a vehicle is actually
+   *  assigned (RENTED) to this lead. Field-first: this must never block the
+   *  intake from completing — it exists so the unmet need stays visible to
+   *  Ops instead of silently dropping. */
+  loanerRequestedUnfulfilled?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +104,10 @@ export interface LeadVehicle {
   vehicleModel?: string;
   vin?: string;
   severity?: StormSeverity;
+  /** True for the one anchor row every document upload attaches to (see
+   *  ensurePrimaryLeadVehicle) — never a vehicle beyond the lead's primary
+   *  one, so this is always false for anything in IntakeLead.additionalVehicles. */
+  isPrimary?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +283,12 @@ export interface IntakeDocumentRef {
   kind: IntakeDocKind;
   fileName: string;
   storagePath?: string | null;
+  /** Bytes, when the caller fetched it (listVehicleDocuments does; a
+   *  freshly-uploaded ref returned inline from uploadVehicleDocument does
+   *  not bother re-selecting it back). No signed-URL helper exists yet, so
+   *  this is the only thing besides fileName worth showing about a document
+   *  without offering a dead "view" link. */
+  byteSize?: number | null;
 }
 
 /** A file captured in a wizard/form before the entity it belongs to exists
@@ -322,6 +339,12 @@ export interface IntakeSubmission {
   assignedStaffName?: string;
   /** Rental/loaner assignment, when a loaner was provided (dual agreement). */
   rental?: RentalAssignmentInfo | null;
+  /** True when the rep had "provide loaner" on but it won't be fulfilled at
+   *  save time — no vehicle was available to select, or the one selected
+   *  will be held pending driver documents (handoverAllowed false).
+   *  Computed by the caller (it alone knows both facts synchronously before
+   *  submit) and persisted as-is — see intake_leads.loaner_requested_unfulfilled. */
+  loanerRequestedUnfulfilled?: boolean;
   /** PNG data URL of the customer's e-signature for the repair AOB. Empty
    *  when the AOB is being routed to a remote proxy policyholder instead of
    *  signed on-site. Distinct from rentalAgreementSignatureDataUrl below —

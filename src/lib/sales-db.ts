@@ -76,6 +76,7 @@ export interface LeadRow {
   rental_agreement_signature_url?: string | null;
   rental_agreement_accepted?: boolean | null;
   rental_agreement_signed_at?: string | null;
+  loaner_requested_unfulfilled?: boolean | null;
 }
 
 function rowToLead(row: LeadRow): IntakeLead {
@@ -117,6 +118,7 @@ function rowToLead(row: LeadRow): IntakeLead {
     rentalAgreementSignatureUrl: row.rental_agreement_signature_url ?? undefined,
     rentalAgreementAccepted: row.rental_agreement_accepted ?? undefined,
     rentalAgreementSignedAt: row.rental_agreement_signed_at ?? undefined,
+    loanerRequestedUnfulfilled: row.loaner_requested_unfulfilled ?? undefined,
   };
 }
 
@@ -202,6 +204,7 @@ interface LeadVehicleRow {
   vehicle_model: string | null;
   vin: string | null;
   severity: StormSeverity | null;
+  is_primary: boolean;
 }
 
 function rowToLeadVehicle(row: LeadVehicleRow): LeadVehicle {
@@ -212,6 +215,7 @@ function rowToLeadVehicle(row: LeadVehicleRow): LeadVehicle {
     vehicleModel: row.vehicle_model ?? undefined,
     vin: row.vin ?? undefined,
     severity: row.severity ?? undefined,
+    isPrimary: row.is_primary,
   };
 }
 
@@ -225,6 +229,11 @@ const localLeadVehicles = new Map<string, LeadVehicle[]>();
  * households a storm hit multiple vehicles at. Best-effort: a missing/
  * unmigrated table just leaves leads without the field, same as any other
  * DB-first-with-fallback read here.
+ *
+ * Excludes is_primary — every lead has a primary lead_vehicles row now (the
+ * anchor ensurePrimaryLeadVehicle creates for document uploads), and
+ * without this filter that row shows up as a phantom "+1 more vehicle" on
+ * every single-vehicle lead.
  */
 async function attachAdditionalVehicles(leads: IntakeLead[]): Promise<IntakeLead[]> {
   if (leads.length === 0) return leads;
@@ -235,6 +244,7 @@ async function attachAdditionalVehicles(leads: IntakeLead[]): Promise<IntakeLead
     const { data, error } = await supabase
       .from(LEAD_VEHICLES_TABLE)
       .select('*')
+      .eq('is_primary', false)
       .in(
         'lead_id',
         leads.map((l) => l.id),
@@ -353,6 +363,30 @@ async function ensurePrimaryLeadVehicle(
     return existing ? (existing as { id: string }).id : null;
   } catch (err) {
     console.warn(`[sales-db] ensurePrimaryLeadVehicle failed for lead ${leadId}:`, err);
+    return null;
+  }
+}
+
+/**
+ * Read-only counterpart to ensurePrimaryLeadVehicle — looks up a lead's
+ * primary lead_vehicle id without creating one if it's missing. For read
+ * paths like LeadDetailDrawer's document list, where opening a lead to view
+ * it must never have the side effect of writing a row. Returns null (never
+ * throws) when there's no primary row yet or the lookup fails — callers
+ * treat that the same as "no documents to show."
+ */
+export async function getPrimaryLeadVehicleId(leadId: string): Promise<string | null> {
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const { data } = await supabase
+      .from(LEAD_VEHICLES_TABLE)
+      .select('id')
+      .eq('lead_id', leadId)
+      .eq('is_primary', true)
+      .maybeSingle();
+    return data ? (data as { id: string }).id : null;
+  } catch (err) {
+    console.warn(`[sales-db] getPrimaryLeadVehicleId failed for lead ${leadId}:`, err);
     return null;
   }
 }
@@ -494,19 +528,26 @@ export async function listVehicleDocuments(leadVehicleId: string): Promise<Intak
     const supabase = getSupabaseBrowserClient();
     const { data, error } = await supabase
       .from(VEHICLE_DOCUMENTS_TABLE)
-      .select('id, kind, file_name, storage_path')
+      .select('id, kind, file_name, storage_path, byte_size')
       .eq('lead_vehicle_id', leadVehicleId)
       .order('created_at', { ascending: false })
       .limit(100);
     if (error || !data) return [];
-    return (data as { id: string; kind: IntakeDocKind; file_name: string | null; storage_path: string }[]).map(
-      (row) => ({
-        id: row.id,
-        kind: row.kind,
-        fileName: row.file_name ?? '',
-        storagePath: row.storage_path,
-      }),
-    );
+    return (
+      data as {
+        id: string;
+        kind: IntakeDocKind;
+        file_name: string | null;
+        storage_path: string;
+        byte_size: number | null;
+      }[]
+    ).map((row) => ({
+      id: row.id,
+      kind: row.kind,
+      fileName: row.file_name ?? '',
+      storagePath: row.storage_path,
+      byteSize: row.byte_size,
+    }));
   } catch {
     return [];
   }
@@ -756,6 +797,7 @@ export async function saveIntakePackage(
     policyholderMatch,
     proxyPolicyholder: policyholderMatch ? undefined : submission.proxyPolicyholder ?? undefined,
     remoteAobStatus: policyholderMatch ? undefined : 'NOT_SENT',
+    loanerRequestedUnfulfilled: submission.loanerRequestedUnfulfilled ?? false,
   };
 
   try {
@@ -790,6 +832,7 @@ export async function saveIntakePackage(
       policyholder_match: policyholderMatch,
       proxy_policyholder: lead.proxyPolicyholder ?? null,
       remote_aob_status: lead.remoteAobStatus ?? null,
+      loaner_requested_unfulfilled: lead.loanerRequestedUnfulfilled ?? false,
     });
     if (error) {
       /* fall through to local store */
@@ -913,6 +956,8 @@ export async function createDigitalLead(input: DigitalLeadInput): Promise<Intake
       policyholder_match: lead.policyholderMatch,
       proxy_policyholder: lead.proxyPolicyholder ?? null,
       remote_aob_status: lead.remoteAobStatus ?? null,
+      // No loaner concept in this capture path (no fleet step) — always false.
+      loaner_requested_unfulfilled: false,
     });
     if (error) {
       /* fall through to local store */

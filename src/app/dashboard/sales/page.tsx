@@ -196,8 +196,17 @@ function LeadCard({
         lead.zipCode ||
         lead.severity ||
         (lead.damagePhotos?.length ?? 0) > 0 ||
-        (lead.additionalVehicles?.length ?? 0) > 0) && (
+        (lead.additionalVehicles?.length ?? 0) > 0 ||
+        lead.loanerRequestedUnfulfilled) && (
         <div className="mt-1.5 flex flex-wrap gap-1">
+          {lead.loanerRequestedUnfulfilled && (
+            <span
+              className="rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300"
+              title="Customer wanted a loaner — not yet fulfilled. See Fleet."
+            >
+              🔑 Loaner needed
+            </span>
+          )}
           {(lead.additionalVehicles?.length ?? 0) > 0 && (
             <span
               className="rounded border border-violet-500/40 bg-violet-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-violet-300"

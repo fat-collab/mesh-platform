@@ -437,12 +437,15 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
     // provisioning (see convertLeadToRO), where a missing item blocks
     // opening the repair order instead of blocking the lead from being
     // saved. See the persistent warning rendered in the Step 2 UI below.
-    // Vehicle selection is required to advance; the driver-document BLOCK
-    // gate is enforced separately (handoverAllowed, checked on the final
-    // submit button) rather than here, so a rep can still fill in the rest
-    // of the intake while documents are outstanding — only the actual
-    // key-handover action is what BLOCK is meant to stop.
-    if (step === 4) return !provideLoaner || selectedVehicleId !== null;
+    // Step 4: field-first, same reasoning as the checklist above — wanting a
+    // loaner and one being available right now are different facts. This
+    // used to require selectedVehicleId !== null whenever provideLoaner was
+    // on, which blocked the rep from finishing the intake at all when the
+    // fleet was empty, with no way through except silently turning the
+    // loaner request off. It never gates step advancement now; submit()
+    // records the unmet need instead (loanerRequestedUnfulfilled) rather
+    // than discarding it. The driver-document BLOCK gate (handoverAllowed)
+    // is enforced separately on the final submit button, not here.
     if (step === 5) {
       const aobOk = !requiresAobSignature || (signatureDataUrl !== null && agreed);
       const rentalOk = !requiresRentalSignature || (rentalSignatureDataUrl !== null && rentalAgreed);
@@ -490,6 +493,14 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
             }
           : null;
 
+      // The customer wanted a loaner but it won't be fulfilled at save time
+      // — either no vehicle was available to select (rental is null despite
+      // provideLoaner) or the one selected will be held pending driver
+      // documents (handoverAllowed false). Both facts are already known
+      // synchronously here, before assignVehicle/reserveVehicle ever run —
+      // see intake_leads.loaner_requested_unfulfilled.
+      const loanerUnfulfilled = provideLoaner && (!rental || !handoverAllowed);
+
       const proxyPolicyholder: ProxyPolicyholder | null = policyholderMatch
         ? null
         : {
@@ -518,6 +529,7 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
         walkaround,
         hailMatrix,
         conditionNotes: conditionNotes.trim(),
+        loanerRequestedUnfulfilled: loanerUnfulfilled,
         assignedStaffId,
         assignedStaffName: assignedStaffName.trim() || undefined,
         rental,
@@ -543,14 +555,17 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
       }
 
       // Dual-agreement: assign the loaner against the new lead. Field-first —
-      // a missing BLOCK-required driver document must never cost the rep
-      // the intake. When handoverAllowed, this is a full checkout (RENTED,
-      // real mileage/fuel). When it's not, the vehicle is held RESERVED
-      // instead — the existing two-phase state (reserveVehicle, already
-      // used by the routing panel's own hold flow) rather than fabricating
-      // a checkout with a document requirement unmet. Either way, the
-      // driver info actually captured is recorded so nothing has to be
-      // re-entered once the missing document arrives.
+      // neither a missing BLOCK-required driver document nor an empty fleet
+      // must ever cost the rep the intake. When handoverAllowed, this is a
+      // full checkout (RENTED, real mileage/fuel). When it's not, the
+      // vehicle is held RESERVED instead — the existing two-phase state
+      // (reserveVehicle, already used by the routing panel's own hold flow)
+      // rather than fabricating a checkout with a document requirement
+      // unmet. Either way, the driver info actually captured is recorded so
+      // nothing has to be re-entered once the missing document arrives.
+      // loanerUnfulfilled (computed above, persisted on the lead) is the
+      // durable record of both branches below going unfulfilled — this
+      // message is just the rep-facing echo of it at submit time.
       let loanerHoldMessage: string | undefined;
       if (rental) {
         if (handoverAllowed) {
@@ -564,7 +579,7 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
           });
         } else {
           await reserveVehicle(rental.vehicleId, lead.id, submission.customerName);
-          loanerHoldMessage = `Keys for ${rental.makeModel} are HELD (not released) — missing required driver document(s). Complete them in Fleet to release.`;
+          loanerHoldMessage = `Keys for ${rental.makeModel} are HELD (not released) — missing required driver document(s). This is recorded for Ops; complete them in Fleet to release.`;
         }
         // Records who actually took the keys — may differ from the AOB
         // signer above. Best-effort internally (see rental-db.ts); never
@@ -597,6 +612,13 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
           rentalAgreementAttestedBy: rentalAgreementAttested ? attestedBy : null,
           rentalAgreementAttestedAt: rentalAgreementAttested ? nowIso : null,
         });
+      } else if (provideLoaner) {
+        // No vehicle was available to select at all (rental is null despite
+        // provideLoaner) — nothing to assign or reserve. loanerUnfulfilled
+        // already persisted the need on the lead; this is just the
+        // rep-facing echo of it.
+        loanerHoldMessage =
+          "No loaner vehicle was available — the customer's request has been recorded; Ops will follow up once a vehicle frees up.";
       }
 
       // Remote AOB Execution Gate: dispatch the secure signing link. Best-
@@ -1072,7 +1094,9 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                 <>
                   {availableFleet.length === 0 ? (
                     <p className="rounded-md border border-amber-500/30 bg-amber-500/10 p-2 text-[11px] text-amber-200">
-                      No fleet units currently available.
+                      No fleet units currently available. You can still finish this intake — the
+                      customer&apos;s loaner request will be recorded and Ops will follow up once a
+                      vehicle frees up.
                     </p>
                   ) : (
                     <div className="space-y-1.5">
@@ -1425,9 +1449,11 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                 <Row
                   label="Loaner"
                   value={
-                    provideLoaner && selectedVehicleId
-                      ? `${availableFleet.find((v) => v.id === selectedVehicleId)?.makeModel ?? selectedVehicleId}`
-                      : 'None'
+                    !provideLoaner
+                      ? 'None'
+                      : selectedVehicleId
+                        ? `${availableFleet.find((v) => v.id === selectedVehicleId)?.makeModel ?? selectedVehicleId}`
+                        : 'Requested — none available'
                   }
                 />
                 <Row
@@ -1476,11 +1502,17 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                   Rental agreement signature and acceptance are required (Step 5) before submitting.
                 </p>
               )}
-              {provideLoaner && !handoverAllowed && (
+              {provideLoaner && !selectedVehicleId && (
+                <p className="text-[11px] text-amber-300">
+                  No fleet vehicle is available — the intake will still save, and this will be
+                  recorded as an unmet loaner request for Ops to follow up once a vehicle frees up.
+                </p>
+              )}
+              {provideLoaner && selectedVehicleId && !handoverAllowed && (
                 <p className="text-[11px] text-amber-300">
                   Missing handover requirement(s) above (Steps 4–5) — the intake will still save,
-                  but this vehicle will stay RESERVED instead of being released. Complete the
-                  requirement(s) in Fleet to release it.
+                  but this vehicle will stay RESERVED instead of being released. This is recorded
+                  for Ops; complete the requirement(s) in Fleet to release it.
                 </p>
               )}
             </div>

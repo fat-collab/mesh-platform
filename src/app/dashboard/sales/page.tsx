@@ -11,9 +11,9 @@
  *
  * Each tab is presented through the same 4 streamlined pipeline stages (New
  * Inquiries -> Triage & Routing -> Agreement Signed / AOB Executed ->
- * Fulfilled), a presentation-layer grouping of the underlying LeadStatus
- * (unchanged) plus dispatchStatus for mobile-only fulfillment. Closed leads
- * (Lost / Lost to Competitor / Cancelled) stay in a separate toggled panel.
+ * Fulfilled), a presentation-layer grouping of the underlying LeadStatus.
+ * Closed leads (Lost / Lost to Competitor / Cancelled) stay in a separate
+ * toggled panel.
  *
  * Backed by sales-db with a local fallback so the board always renders.
  */
@@ -40,7 +40,7 @@ import { DigitalIntakeQuickAdd } from '@/components/sales/DigitalIntakeQuickAdd'
 import { LeadActionCard } from '@/components/sales/LeadActionCard';
 import { LeadOwnerChip } from '@/components/sales/LeadOwnerChip';
 import { LeadDetailDrawer } from '@/components/sales/LeadDetailDrawer';
-import { RoutingActionPanel } from '@/components/sales/RoutingActionPanel';
+import { LoanerReserveButton } from '@/components/sales/LoanerReserveButton';
 import { CommissionPanel } from '@/components/sales/CommissionPanel';
 
 /** The 4 streamlined pipeline gates shown on each tab's board. */
@@ -84,25 +84,16 @@ const STAGE_STATUS: Record<SalesColumn, LeadStatus> = {
 };
 
 /** Maps a granular LeadStatus onto its streamlined stage (or null for a
- *  terminal/closed status). Presentation-only — LeadStatus is unchanged. */
+ *  terminal/closed status). Presentation-only — LeadStatus is unchanged.
+ *  FULFILLED is reached only via CONVERTED now — MESH is shop-only, so a
+ *  lead can no longer be fulfilled by a mobile dispatch completing without
+ *  ever producing a repair order. */
 function statusToStage(status: LeadStatus): SalesColumn | null {
   if (TERMINAL_STATUSES.includes(status)) return null;
   if (status === 'CONVERTED') return 'FULFILLED';
   if (status === 'AOB_SIGNED' || status === 'APPROVED') return 'AGREEMENT_SIGNED';
   if (status === 'CONTACTED' || status === 'ESTIMATE_SENT') return 'TRIAGE_ROUTING';
   return 'NEW_INQUIRIES';
-}
-
-/**
- * Maps a lead onto one of the 4 streamlined columns. Presentation-only — the
- * granular LeadStatus is unchanged underneath. Fulfilled additionally covers
- * a mobile house call marked COMPLETED (dispatchStatus, not LeadStatus),
- * since a mobile-only fulfillment never produces an RO / CONVERTED status.
- */
-function pipelineColumn(lead: IntakeLead): SalesColumn | null {
-  if (TERMINAL_STATUSES.includes(lead.status)) return null;
-  if (lead.dispatchStatus === 'COMPLETED') return 'FULFILLED';
-  return statusToStage(lead.status);
 }
 
 const HUB_TABS: { id: LeadChannel; label: string }[] = [
@@ -156,8 +147,6 @@ function LeadCard({
 }) {
   const productionStage = lead.status === 'CONVERTED' ? stageByClaim.get(lead.claimNumber) : undefined;
   const productionMeta = productionStage ? STAGE_META[productionStage] : null;
-  const showRouting =
-    lead.status !== 'NEW' && lead.status !== 'CONVERTED' && !TERMINAL_STATUSES.includes(lead.status);
 
   // The stage select only offers the 4 canonical stage statuses (+ Closed) —
   // a lead already sitting in a folded legacy status (ESTIMATE_SENT,
@@ -258,11 +247,6 @@ function LeadCard({
           🏭 {productionMeta.label}
         </span>
       )}
-      {!productionMeta && lead.dispatchStatus === 'COMPLETED' && (
-        <span className="mt-1.5 inline-flex rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300">
-          🏭 Mobile Service Completed
-        </span>
-      )}
 
       <LeadOwnerChip leadId={lead.id} staffName={lead.assignedStaffName} onAssigned={onRefetch} />
 
@@ -288,7 +272,7 @@ function LeadCard({
         </select>
       </div>
 
-      {showRouting && <RoutingActionPanel lead={lead} onUpdated={onRefetch} />}
+      <LoanerReserveButton lead={lead} onUpdated={onRefetch} />
 
       {(lead.status === 'APPROVED' ||
         lead.status === 'AOB_SIGNED' ||
@@ -400,7 +384,7 @@ export default function SalesIntakePage() {
     const groups = {} as Record<SalesColumn, IntakeLead[]>;
     for (const c of COLUMN_ORDER) groups[c] = [];
     for (const lead of tabLeads) {
-      const column = pipelineColumn(lead);
+      const column = statusToStage(lead.status);
       if (column) groups[column].push(lead);
     }
     return groups;

@@ -60,11 +60,6 @@ export interface IntakeLead {
    *  damagePhotos above (a narrower digital-intake-only subset). Lazily
    *  populated; not every lead list fetch attaches this. */
   documents?: IntakeDocumentRef[];
-  /** Post-contact dual-path routing decision. */
-  routingPath?: RoutingPath;
-  /** Field agent assigned when routingPath is MOBILE_HOUSE_CALL. */
-  dispatchStaffName?: string;
-  dispatchStatus?: DispatchStatus;
   /** Named Insured / Policyholder Match — false when the person at intake
    *  isn't the policyholder on file (defaults true). */
   policyholderMatch?: boolean;
@@ -167,31 +162,6 @@ export const STORM_SEVERITY_LABEL: Record<StormSeverity, string> = {
   MODERATE: 'Moderate',
   SEVERE: 'Severe',
   CATASTROPHIC: 'Catastrophic',
-};
-
-/** Post-contact dual-path routing decision on a lead card. */
-export type RoutingPath = 'SHOP_DROPOFF' | 'MOBILE_HOUSE_CALL';
-
-export const ROUTING_PATH_LABEL: Record<RoutingPath, string> = {
-  SHOP_DROPOFF: 'Shop Drop-off + Fleet Reservation',
-  MOBILE_HOUSE_CALL: 'Mobile House Call',
-};
-
-/** Field dispatch lifecycle, once a lead is routed to a mobile house call. */
-export type DispatchStatus = 'DISPATCHED' | 'EN_ROUTE' | 'ON_SITE' | 'COMPLETED';
-
-export const DISPATCH_STATUS_ORDER: readonly DispatchStatus[] = [
-  'DISPATCHED',
-  'EN_ROUTE',
-  'ON_SITE',
-  'COMPLETED',
-];
-
-export const DISPATCH_STATUS_LABEL: Record<DispatchStatus, string> = {
-  DISPATCHED: 'Dispatched',
-  EN_ROUTE: 'En Route',
-  ON_SITE: 'On Site',
-  COMPLETED: 'Completed',
 };
 
 /** Pipeline column order, left → right. */

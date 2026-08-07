@@ -1,7 +1,7 @@
 'use client';
 
 /**
- * ReserveVehicleModal — Book Shop Drop-off's vehicle picker, as a modal.
+ * ReserveVehicleModal — fleet vehicle picker for reserving a loaner.
  *
  * Was an inline <select> cramped into the lead card (RoutingActionPanel);
  * this shows live fleet inventory (mileage, fuel, plate) per unit so a rep
@@ -9,11 +9,15 @@
  * (RESERVED, bound to this lead) without fabricating checkout data — real
  * mileage/fuel are only captured later, at physical handoff (Fleet Command
  * Center's Confirm Pickup).
+ *
+ * No longer touches lead routing (MESH is shop-only; routing_path/
+ * dispatch_status were removed) — reserving a loaner and how the vehicle's
+ * repair is routed are independent facts. See LoanerReserveButton, the
+ * lead-card entry point this is opened from.
  */
 import { useEffect, useState } from 'react';
 import { clsx } from 'clsx';
 import { getAvailableVehicles, reserveVehicle } from '@/lib/rental-db';
-import { updateLeadRouting } from '@/lib/sales-db';
 import type { IntakeLead, RentalVehicle } from '@/components/sales/types';
 
 interface ReserveVehicleModalProps {
@@ -47,7 +51,6 @@ export function ReserveVehicleModal({ lead, onClose, onReserved }: ReserveVehicl
     setError(null);
     try {
       await reserveVehicle(vehicleId, lead.id, lead.customerName);
-      await updateLeadRouting(lead.id, 'SHOP_DROPOFF');
       onReserved();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to reserve fleet vehicle.');

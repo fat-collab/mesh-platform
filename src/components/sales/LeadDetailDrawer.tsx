@@ -20,6 +20,7 @@ import {
   listVehicleDocuments,
   type LeadDetailsPatch,
 } from '@/lib/sales-db';
+import { getSignedDocumentUrls } from '@/lib/storage-upload';
 import { getCurrentProfile } from '@/lib/auth';
 import { getSupabaseBrowserClient } from '@/lib/supabase';
 import { getCarrierIntel, CHECKLIST_ITEM_LABEL } from '@/lib/carrier-intel';
@@ -67,14 +68,22 @@ const DOC_ACCEPT: Partial<Record<IntakeDocKind, string>> = {
 };
 const DEFAULT_DOC_ACCEPT = 'image/*';
 
-// No signed-URL helper exists yet, so a captured document's size is the only
-// useful thing to show besides its name — null renders nothing rather than
-// a misleading "0 B" for a legacy row inserted before byte_size was tracked.
+// null renders nothing rather than a misleading "0 B" for a legacy row
+// inserted before byte_size was tracked.
 function formatBytes(bytes: number | null | undefined): string | null {
   if (bytes == null) return null;
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// Thumbnail vs. plain view-link — inferred from the extension, since
+// IntakeDocumentRef doesn't carry a MIME type. Covers what compressImageFile
+// ever produces (always .jpg going forward) plus the legacy types the
+// 'documents' bucket still allows (png/webp/heic).
+const IMAGE_EXT_RE = /\.(jpe?g|png|webp|heic)$/i;
+function isImageFileName(fileName: string): boolean {
+  return IMAGE_EXT_RE.test(fileName);
 }
 
 interface LeadDetailDrawerProps {
@@ -103,6 +112,7 @@ export function LeadDetailDrawer({ lead, onClose, onSaved }: LeadDetailDrawerPro
 
   const [documents, setDocuments] = useState<IntakeDocumentRef[]>(lead.documents ?? []);
   const [documentsLoading, setDocumentsLoading] = useState(true);
+  const [signedUrls, setSignedUrls] = useState<Map<string, string>>(new Map());
   const [ownerName, setOwnerName] = useState(lead.assignedStaffName ?? '');
   const [ownerEditing, setOwnerEditing] = useState(false);
   const [ownerDraft, setOwnerDraft] = useState(ownerName);
@@ -150,6 +160,26 @@ export function LeadDetailDrawer({ lead, onClose, onSaved }: LeadDetailDrawerPro
       cancelled = true;
     };
   }, [lead.id]);
+
+  // Minted lazily here, at render time, for exactly the documents currently
+  // in state — never from a list/board query. Re-runs whenever `documents`
+  // changes (initial load, or after an upload/remove), one batched call per
+  // run regardless of how many documents are showing.
+  useEffect(() => {
+    let cancelled = false;
+    const paths = documents.map((d) => d.storagePath).filter((p): p is string => Boolean(p));
+    if (paths.length === 0) {
+      setSignedUrls(new Map());
+      return;
+    }
+    void (async () => {
+      const urls = await getSignedDocumentUrls(paths);
+      if (!cancelled) setSignedUrls(urls);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [documents]);
 
   const canReassignOwner = role === 'MANAGER' || role === 'EXECUTIVE';
 
@@ -288,22 +318,49 @@ export function LeadDetailDrawer({ lead, onClose, onSaved }: LeadDetailDrawerPro
         </div>
         {captured.length > 0 && (
           <div className="mb-1 space-y-1">
-            {captured.map((doc) => (
-              <div key={doc.id ?? doc.storagePath} className="flex items-center justify-between gap-2">
-                <p className="truncate text-[11px] text-zinc-500">
-                  {doc.fileName}
-                  {formatBytes(doc.byteSize) ? ` · ${formatBytes(doc.byteSize)}` : ''}
-                </p>
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => void handleRemove(kind, doc.id)}
-                  className="shrink-0 text-[11px] font-semibold text-red-400 hover:text-red-300 disabled:opacity-40"
-                >
-                  ✕ Remove
-                </button>
-              </div>
-            ))}
+            {captured.map((doc) => {
+              const signedUrl = doc.storagePath ? signedUrls.get(doc.storagePath) : undefined;
+              const isImage = isImageFileName(doc.fileName);
+              return (
+                <div key={doc.id ?? doc.storagePath} className="flex items-center justify-between gap-2">
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    {signedUrl && isImage && (
+                      <a href={signedUrl} target="_blank" rel="noreferrer" className="shrink-0">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={signedUrl}
+                          alt={doc.fileName}
+                          className="h-8 w-8 rounded border border-zinc-700 object-cover"
+                        />
+                      </a>
+                    )}
+                    <p className="min-w-0 truncate text-[11px] text-zinc-500">
+                      {signedUrl && !isImage ? (
+                        <a
+                          href={signedUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-sky-300 hover:underline"
+                        >
+                          {doc.fileName}
+                        </a>
+                      ) : (
+                        doc.fileName
+                      )}
+                      {formatBytes(doc.byteSize) ? ` · ${formatBytes(doc.byteSize)}` : ''}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void handleRemove(kind, doc.id)}
+                    className="shrink-0 text-[11px] font-semibold text-red-400 hover:text-red-300 disabled:opacity-40"
+                  >
+                    ✕ Remove
+                  </button>
+                </div>
+              );
+            })}
           </div>
         )}
         <input
@@ -488,11 +545,6 @@ export function LeadDetailDrawer({ lead, onClose, onSaved }: LeadDetailDrawerPro
             </p>
           ) : (
             <>
-              <p className="border-t border-zinc-800 pt-3 text-[11px] text-zinc-500">
-                Documents below show file name and size only — there's no preview or download link
-                yet.
-              </p>
-
               {/* --- Carrier-required documentation (gating) --- */}
               {carrierChecklist.length > 0 && (
                 <div className="space-y-2 border-t border-amber-500/20 bg-amber-500/5 p-3">

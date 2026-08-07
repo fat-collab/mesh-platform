@@ -29,6 +29,7 @@ import {
   importEstimateLineItems,
   markPartReceived,
   updatePartStatus,
+  uploadPartInvoice,
 } from '@/lib/ops-db';
 import { parseEstimate, seedDemoEstimateParts } from '@/lib/estimate-parser';
 import { getOEMSpecsByVIN } from '@/lib/ops-mock';
@@ -48,6 +49,7 @@ import { OpsTimelineDispatch, type StallStatus } from './OpsTimelineDispatch';
 import { FleetRentalTracker } from '@/components/ops/FleetRentalTracker';
 import { getSupabaseBrowserClient } from '@/lib/supabase';
 import { getCurrentProfile } from '@/lib/auth';
+import { getSignedDocumentUrls } from '@/lib/storage-upload';
 import {
   DISCREPANCY_REASONS,
   DISCREPANCY_REASON_LABEL,
@@ -131,6 +133,23 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 /** The inline form currently open on a line item, if any. */
 type ActiveForm = { index: number; type: 'receive' | 'report' } | null;
 
+/**
+ * parts_line_items.invoice_url is dual-mode: a rep can either paste an
+ * external URL (a supplier portal link, etc.) directly into the "Invoice
+ * URL" field, or upload a file — which now goes through uploadPartInvoice
+ * (ops-db.ts) into the private 'documents' bucket and stores a bare Storage
+ * path, not a URL. The two shapes are reliably distinguishable: a Storage
+ * path is always {org-uuid}/repair-orders/{ro}/invoice-{uuid}.{ext} and
+ * never contains a scheme; an external URL always does (https://, etc.).
+ * This is the one place that check lives — every read site should use it
+ * rather than re-deriving the rule, since a raw Storage path rendered
+ * directly as an <a href> silently resolves to a broken relative link
+ * instead of a working invoice.
+ */
+function isExternalInvoiceUrl(value: string): boolean {
+  return value.includes('://');
+}
+
 export interface RODetailDrawerProps {
   order: BoardOrder | null;
   onClose: () => void;
@@ -151,11 +170,16 @@ export function RODetailDrawer({
   const [items, setItems] = useState<PartsLineItem[]>(parts);
   const [dbBacked, setDbBacked] = useState(false);
   const [activeForm, setActiveForm] = useState<ActiveForm>(null);
+  // Signed URLs for invoiceUrls that are Storage paths, keyed by that path
+  // (see isExternalInvoiceUrl). Minted lazily whenever `items` changes —
+  // never from the parts fetch itself.
+  const [signedInvoiceUrls, setSignedInvoiceUrls] = useState<Map<string, string>>(new Map());
 
   // Receive-form fields.
   const [invoiceNumber, setInvoiceNumber] = useState('');
   const [invoiceUrl, setInvoiceUrl] = useState('');
   const [invoiceFileName, setInvoiceFileName] = useState<string | null>(null);
+  const [invoiceUploading, setInvoiceUploading] = useState(false);
   // Report-form fields.
   const [reason, setReason] = useState<DiscrepancyReason>(DISCREPANCY_REASONS[0]);
   const [rmaNumber, setRmaNumber] = useState('');
@@ -194,6 +218,24 @@ export function RODetailDrawer({
   useEffect(() => {
     setShown(Boolean(order));
   }, [order]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const paths = items
+      .map((it) => it.invoiceUrl)
+      .filter((url): url is string => typeof url === 'string' && !isExternalInvoiceUrl(url));
+    if (paths.length === 0) {
+      setSignedInvoiceUrls(new Map());
+      return;
+    }
+    void (async () => {
+      const urls = await getSignedDocumentUrls(paths);
+      if (!cancelled) setSignedInvoiceUrls(urls);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [items]);
 
   // Load live parts for this claim. If the table has rows, switch to the
   // DB-backed path (mutations persist + re-fetch). On error (table not yet
@@ -413,11 +455,19 @@ export function RODetailDrawer({
     }
   };
 
-  const onInvoiceFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const onInvoiceFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
-    setInvoiceFileName(file.name);
-    setInvoiceUrl(URL.createObjectURL(file));
+    if (!file || !order) return;
+    setInvoiceUploading(true);
+    try {
+      const path = await uploadPartInvoice(order.id, file);
+      if (path) {
+        setInvoiceFileName(file.name);
+        setInvoiceUrl(path);
+      }
+    } finally {
+      setInvoiceUploading(false);
+    }
   };
 
   // --- estimate import -----------------------------------------------------
@@ -1052,6 +1102,12 @@ export function RODetailDrawer({
                       activeForm?.index === i && activeForm.type === 'receive';
                     const isReportOpen =
                       activeForm?.index === i && activeForm.type === 'report';
+                    const invoiceHref =
+                      item.invoiceUrl && isExternalInvoiceUrl(item.invoiceUrl)
+                        ? item.invoiceUrl
+                        : item.invoiceUrl
+                          ? signedInvoiceUrls.get(item.invoiceUrl)
+                          : undefined;
                     return (
                       <li
                         key={`${item.name}-${i}`}
@@ -1087,17 +1143,24 @@ export function RODetailDrawer({
                                 : 'No lead time'}
                               {item.invoiceNumber ? ` · Inv ${item.invoiceNumber}` : ''}
                               {item.invoiceUrl ? (
-                                <>
-                                  {' · '}
-                                  <a
-                                    href={item.invoiceUrl}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                    className="text-sky-400 hover:text-sky-300 hover:underline"
-                                  >
-                                    invoice
-                                  </a>
-                                </>
+                                invoiceHref ? (
+                                  <>
+                                    {' · '}
+                                    <a
+                                      href={invoiceHref}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className="text-sky-400 hover:text-sky-300 hover:underline"
+                                    >
+                                      invoice
+                                    </a>
+                                  </>
+                                ) : (
+                                  <>
+                                    {' · '}
+                                    <span className="text-zinc-600">invoice</span>
+                                  </>
+                                )
                               ) : (
                                 ''
                               )}
@@ -1165,10 +1228,14 @@ export function RODetailDrawer({
                               <span className="mb-1 block">Or upload invoice file</span>
                               <input
                                 type="file"
-                                onChange={onInvoiceFile}
+                                disabled={invoiceUploading}
+                                onChange={(e) => void onInvoiceFile(e)}
                                 className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-0.5 file:text-zinc-200"
                               />
-                              {invoiceFileName && (
+                              {invoiceUploading && (
+                                <span className="mt-1 block text-zinc-400">Uploading…</span>
+                              )}
+                              {!invoiceUploading && invoiceFileName && (
                                 <span className="mt-1 block truncate text-emerald-300">
                                   Attached: {invoiceFileName}
                                 </span>

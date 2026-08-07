@@ -26,7 +26,7 @@ import {
   type RentalHandoverRequirements,
   type RentalLoanDriverRecord,
 } from '@/lib/rental-db';
-import { genUuid } from '@/lib/storage-upload';
+import { genUuid, getSignedDocumentUrls } from '@/lib/storage-upload';
 import type { RentalStatus, RentalVehicle } from '@/components/sales/types';
 
 const STATUS_TONE: Record<RentalStatus, string> = {
@@ -55,6 +55,11 @@ export default function FleetPage() {
   });
   const [loanDriver, setLoanDriver] = useState<RentalLoanDriverRecord | null>(null);
   const [rentalAgreementSignatureUrl, setRentalAgreementSignatureUrl] = useState<string | null>(null);
+  // Signed URLs for whichever of licenseDocumentUrl / insuranceDocumentUrl /
+  // rentalAgreementSignatureUrl are on file, keyed by that Storage path.
+  // Minted once, batched, when Confirm Pickup opens for a RESERVED unit —
+  // never eagerly for the whole fleet list.
+  const [signedHandoverUrls, setSignedHandoverUrls] = useState<Map<string, string>>(new Map());
   const [newDriverName, setNewDriverName] = useState('');
   const [newLicenseFile, setNewLicenseFile] = useState<{ fileName: string; file: File } | null>(null);
   const [newInsuranceFile, setNewInsuranceFile] = useState<{ fileName: string; file: File } | null>(
@@ -157,6 +162,7 @@ export default function FleetPage() {
     setRentalAgreementAttested(false);
     setLoanDriver(null);
     setRentalAgreementSignatureUrl(null);
+    setSignedHandoverUrls(new Map());
     // Confirm Pickup on a RESERVED unit is the moment keys actually change
     // hands — pull whatever driver documentation the wizard already
     // captured (possibly partial, if that's why it's still RESERVED) so the
@@ -164,15 +170,32 @@ export default function FleetPage() {
     // lives on the lead, not the loan-driver row or the vehicle — Fleet has
     // no other visibility into it.
     if (v.currentStatus === 'RESERVED') {
-      void getLatestLoanDriver(v.id, v.assignedLeadId).then((record) => setLoanDriver(record));
-      void getLeadRentalAgreementSignature(v.assignedLeadId ?? null).then((url) =>
-        setRentalAgreementSignatureUrl(url),
-      );
+      void (async () => {
+        const [record, signatureUrl] = await Promise.all([
+          getLatestLoanDriver(v.id, v.assignedLeadId),
+          getLeadRentalAgreementSignature(v.assignedLeadId ?? null),
+        ]);
+        setLoanDriver(record);
+        setRentalAgreementSignatureUrl(signatureUrl);
+        // A manager releasing keys should be able to look at the license,
+        // not just see that a filename exists — a blurry or expired one
+        // passes the "on file" check identically to a good one otherwise.
+        const paths = [record?.licenseDocumentUrl, record?.insuranceDocumentUrl, signatureUrl].filter(
+          (p): p is string => typeof p === 'string',
+        );
+        setSignedHandoverUrls(await getSignedDocumentUrls(paths));
+      })();
     }
   };
 
   // A RESERVED unit's Confirm Pickup is gated; a fresh walk-in Assign from
   // AVAILABLE is not (out of scope for this pass — see the state comment).
+  // This is a manager at a counter, not a rep at a doorstep — requiring a
+  // name here doesn't run into the field-first rule the intake flows follow.
+  const driverNameSatisfied = (v: RentalVehicle) =>
+    v.currentStatus !== 'RESERVED' ||
+    newDriverName.trim() !== '' ||
+    Boolean(loanDriver?.driverName?.trim());
   const licenseSatisfied = (v: RentalVehicle) =>
     v.currentStatus !== 'RESERVED' ||
     isHandoverItemSatisfied(handoverRequirements.driversLicense, {
@@ -195,7 +218,7 @@ export default function FleetPage() {
       hasDocument: Boolean(rentalAgreementSignatureUrl),
     });
   const handoverAllowed = (v: RentalVehicle) =>
-    licenseSatisfied(v) && insuranceSatisfied(v) && rentalAgreementSatisfied(v);
+    driverNameSatisfied(v) && licenseSatisfied(v) && insuranceSatisfied(v) && rentalAgreementSatisfied(v);
 
   const confirmAssign = async (v: RentalVehicle) => {
     if (v.currentStatus === 'RESERVED' && !handoverAllowed(v)) return; // belt-and-suspenders; button is also disabled
@@ -209,6 +232,15 @@ export default function FleetPage() {
       insuranceAttested ||
       rentalAgreementAttested;
     if (v.currentStatus === 'RESERVED' && hasNewCapture) {
+      // No fallback to the customer's name or a placeholder — gated above
+      // (driverNameSatisfied is part of handoverAllowed), so one of these is
+      // guaranteed non-empty by the time a RESERVED confirm reaches here.
+      // The defensive return matches the belt-and-suspenders check above: a
+      // handover record asserting the policyholder drove, with someone
+      // else's license attached, is worse than no record — it looks
+      // authoritative when it isn't.
+      const driverName = newDriverName.trim() || loanDriver?.driverName?.trim() || '';
+      if (!driverName) return;
       const attestedBy = assignAgent.trim() || 'Rep';
       const nowIso = new Date().toISOString();
       const loanDriverId = genUuid();
@@ -220,7 +252,7 @@ export default function FleetPage() {
         id: loanDriverId,
         rentalVehicleId: v.id,
         leadId: v.assignedLeadId,
-        driverName: newDriverName.trim() || loanDriver?.driverName || assignCustomer.trim() || 'Unknown driver',
+        driverName,
         licenseDocumentUrl: licensePath ?? loanDriver?.licenseDocumentUrl ?? null,
         insuranceDocumentUrl: insurancePath ?? loanDriver?.insuranceDocumentUrl ?? null,
         licenseNumber: newLicenseNumber.trim() || null,
@@ -379,6 +411,7 @@ export default function FleetPage() {
                     handoverRequirements={handoverRequirements}
                     loanDriver={loanDriver}
                     rentalAgreementSignatureUrl={rentalAgreementSignatureUrl}
+                    signedHandoverUrls={signedHandoverUrls}
                     newDriverName={newDriverName}
                     newLicenseFile={newLicenseFile}
                     newInsuranceFile={newInsuranceFile}
@@ -443,6 +476,7 @@ interface FleetRowProps {
   handoverRequirements: RentalHandoverRequirements;
   loanDriver: RentalLoanDriverRecord | null;
   rentalAgreementSignatureUrl: string | null;
+  signedHandoverUrls: Map<string, string>;
   newDriverName: string;
   newLicenseFile: { fileName: string; file: File } | null;
   newInsuranceFile: { fileName: string; file: File } | null;
@@ -487,6 +521,7 @@ function FleetRow({
   handoverRequirements,
   loanDriver,
   rentalAgreementSignatureUrl,
+  signedHandoverUrls,
   newDriverName,
   newLicenseFile,
   newInsuranceFile,
@@ -692,12 +727,30 @@ function FleetRow({
                   Driver on file
                   {loanDriver?.driverName ? ` — ${loanDriver.driverName}` : ' — none captured yet'}
                 </p>
-                <input
-                  value={newDriverName}
-                  onChange={(e) => onNewDriverName(e.target.value)}
-                  placeholder={loanDriver?.driverName || 'Driver full name'}
-                  className="w-full rounded-md border border-zinc-700 bg-zinc-950/70 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500/60 focus:outline-none"
-                />
+                {!loanDriver?.driverName?.trim() && !newDriverName.trim() && (
+                  <span className="block text-[11px] text-red-300">
+                    ✗ Missing — REQUIRED, blocks key release. Type a name, or confirm it&apos;s the
+                    customer below.
+                  </span>
+                )}
+                <div className="flex gap-1.5">
+                  <input
+                    value={newDriverName}
+                    onChange={(e) => onNewDriverName(e.target.value)}
+                    placeholder={loanDriver?.driverName || 'Driver full name'}
+                    className="flex-1 rounded-md border border-zinc-700 bg-zinc-950/70 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500/60 focus:outline-none"
+                  />
+                  {assignCustomer.trim() && (
+                    <button
+                      type="button"
+                      onClick={() => onNewDriverName(assignCustomer.trim())}
+                      title={`Fill with customer name: ${assignCustomer.trim()}`}
+                      className="shrink-0 rounded border border-zinc-700 px-2 py-1 text-[10.5px] font-semibold text-zinc-300 transition-colors hover:bg-zinc-800"
+                    >
+                      Same as customer
+                    </button>
+                  )}
+                </div>
 
                 {handoverRequirements.driversLicense !== 'NONE' && (
                   <div className="space-y-1.5 border-t border-zinc-700/70 pt-2">
@@ -710,8 +763,33 @@ function FleetRow({
                     {handoverRequirements.driversLicense === 'DOCUMENT' ? (
                       <>
                         {loanDriver?.licenseDocumentUrl && !newLicenseFile && (
-                          <span className="block text-[11px] text-emerald-300">
-                            ✓ Already on file — upload below to replace it
+                          <div className="flex items-center gap-2">
+                            {signedHandoverUrls.get(loanDriver.licenseDocumentUrl) ? (
+                              <a
+                                href={signedHandoverUrls.get(loanDriver.licenseDocumentUrl)}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="shrink-0"
+                              >
+                                {/* eslint-disable-next-line @next/next/no-img-element */}
+                                <img
+                                  src={signedHandoverUrls.get(loanDriver.licenseDocumentUrl)}
+                                  alt="Driver's license on file"
+                                  className="h-10 w-10 rounded border border-zinc-700 object-cover"
+                                />
+                              </a>
+                            ) : (
+                              <span className="text-[11px] text-zinc-500">Loading…</span>
+                            )}
+                            <span className="text-[11px] text-emerald-300">
+                              ✓ Already on file — upload below to replace it
+                            </span>
+                          </div>
+                        )}
+                        {!loanDriver?.licenseDocumentUrl && !newLicenseFile && (
+                          <span className="block text-[11px] text-red-300">
+                            ✗ Missing — DOCUMENT required, blocks key release. Upload below to
+                            capture it now.
                           </span>
                         )}
                         <input
@@ -772,8 +850,33 @@ function FleetRow({
                     {handoverRequirements.driverInsurance === 'DOCUMENT' ? (
                       <>
                         {loanDriver?.insuranceDocumentUrl && !newInsuranceFile && (
-                          <span className="block text-[11px] text-emerald-300">
-                            ✓ Already on file — upload below to replace it
+                          <div className="flex items-center gap-2">
+                            {signedHandoverUrls.get(loanDriver.insuranceDocumentUrl) ? (
+                              <a
+                                href={signedHandoverUrls.get(loanDriver.insuranceDocumentUrl)}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="shrink-0"
+                              >
+                                {/* eslint-disable-next-line @next/next/no-img-element */}
+                                <img
+                                  src={signedHandoverUrls.get(loanDriver.insuranceDocumentUrl)}
+                                  alt="Proof of insurance on file"
+                                  className="h-10 w-10 rounded border border-zinc-700 object-cover"
+                                />
+                              </a>
+                            ) : (
+                              <span className="text-[11px] text-zinc-500">Loading…</span>
+                            )}
+                            <span className="text-[11px] text-emerald-300">
+                              ✓ Already on file — upload below to replace it
+                            </span>
+                          </div>
+                        )}
+                        {!loanDriver?.insuranceDocumentUrl && !newInsuranceFile && (
+                          <span className="block text-[11px] text-red-300">
+                            ✗ Missing — DOCUMENT required, blocks key release. Upload below to
+                            capture it now.
                           </span>
                         )}
                         <input
@@ -839,7 +942,26 @@ function FleetRow({
                     </span>
                     {handoverRequirements.rentalAgreement === 'DOCUMENT' ? (
                       rentalAgreementSignatureUrl ? (
-                        <span className="block text-[11px] text-emerald-300">✓ Signed on file</span>
+                        <div className="flex items-center gap-2">
+                          {signedHandoverUrls.get(rentalAgreementSignatureUrl) ? (
+                            <a
+                              href={signedHandoverUrls.get(rentalAgreementSignatureUrl)}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="shrink-0"
+                            >
+                              {/* eslint-disable-next-line @next/next/no-img-element */}
+                              <img
+                                src={signedHandoverUrls.get(rentalAgreementSignatureUrl)}
+                                alt="Rental agreement signature on file"
+                                className="h-10 w-10 rounded border border-zinc-700 bg-white object-contain"
+                              />
+                            </a>
+                          ) : (
+                            <span className="text-[11px] text-zinc-500">Loading…</span>
+                          )}
+                          <span className="text-[11px] text-emerald-300">✓ Signed on file</span>
+                        </div>
                       ) : (
                         <span className="block text-[11px] text-red-300">
                           ✗ Missing — this must be signed during intake; it cannot be captured from

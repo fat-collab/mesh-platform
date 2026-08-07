@@ -2,14 +2,23 @@
  * MESH — shared 'documents' Storage bucket helpers.
  *
  * The one place compression, extension/MIME resolution, and the actual
- * Storage PUT happen — every writer of a document reference (vehicle_documents
- * today; rental_loan_drivers' driver license/insurance photos; remote-AOB
- * signatures and parts_line_items.invoice_url are coming) funnels through
- * this instead of hand-rolling its own upload + path logic, so a change here
- * (compression tuning, a new allowed MIME type) doesn't need to be repeated
- * per caller.
+ * Storage PUT happen — every writer of a document reference
+ * (vehicle_documents, rental_loan_drivers' driver license/insurance photos,
+ * parts_line_items.invoice_url, remote_aob_links.signature_url) funnels
+ * through this instead of hand-rolling its own upload + path logic, so a
+ * change here (compression tuning, a new allowed MIME type) doesn't need to
+ * be repeated per caller.
  */
-import { getSupabaseBrowserClient } from './supabase';
+import { getSupabaseBrowserClient, type MeshSupabaseClient } from './supabase';
+
+/** Minimal shape every caller's Supabase client needs to satisfy — just the
+ *  Storage API, not the full client. Storage isn't parameterized by the
+ *  Database generic, so this is satisfied identically by the browser client
+ *  (getSupabaseBrowserClient) and a service-role server client
+ *  (createSupabaseServerClient) alike. Callers pass their own client rather
+ *  than this module resolving one internally, so a server route can use its
+ *  service-role client without ever touching browser session state. */
+type StorageCapableClient = { storage: MeshSupabaseClient['storage'] };
 
 export const DOCUMENTS_BUCKET = 'documents';
 
@@ -105,6 +114,86 @@ export function assertPersistableDocumentUrl(value: string | null | undefined): 
   }
 }
 
+// 15 minutes — long enough for a rep to view/download while a drawer or
+// modal is open, short enough that a leaked URL doesn't stay valid.
+const SIGNED_URL_TTL_SECONDS = 15 * 60;
+
+/**
+ * Batched signed-URL minting for the private 'documents' bucket — one
+ * createSignedUrls call for many paths, never one call per file. Call this
+ * lazily at render time for exactly what's being displayed right now — never
+ * from a list/board query (getLeads and friends) — since every URL costs a
+ * live Storage round trip and expires in 15 minutes regardless of whether
+ * anyone ever looks at it.
+ *
+ * Path shape is irrelevant here — createSignedUrls is a pure path → URL
+ * lookup against the bucket's actual object keys, with no assumptions about
+ * path structure. Both current uploads
+ * ({org}/leads/{lead}/vehicles/{vehicle}/documents/...) and the handful of
+ * legacy paths without a /vehicles/ segment sign identically; nothing about
+ * this function needs to special-case either shape.
+ *
+ * Best-effort per path, not just per batch: createSignedUrls already
+ * returns one result per input with its own path/error, so one bad path
+ * (deleted object, bad RLS) just doesn't get an entry in the returned map
+ * rather than failing every other path in the same call. A total failure
+ * (network, bucket gone) returns an empty map rather than throwing —
+ * callers treat a missing entry as "no preview available," never a crash.
+ */
+export async function getSignedDocumentUrls(paths: string[]): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  const unique = Array.from(new Set(paths.filter((p): p is string => Boolean(p))));
+  if (unique.length === 0) return result;
+
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const { data, error } = await supabase.storage
+      .from(DOCUMENTS_BUCKET)
+      .createSignedUrls(unique, SIGNED_URL_TTL_SECONDS);
+    if (error || !data) {
+      console.warn('[storage-upload] createSignedUrls failed:', error?.message);
+      return result;
+    }
+    for (const item of data) {
+      if (item.path && item.signedUrl && !item.error) {
+        result.set(item.path, item.signedUrl);
+      } else {
+        console.warn(`[storage-upload] failed to sign ${item.path ?? '(unknown path)'}:`, item.error);
+      }
+    }
+  } catch (err) {
+    console.warn('[storage-upload] getSignedDocumentUrls failed:', err);
+  }
+  return result;
+}
+
+/**
+ * The one place every caller actually PUTs bytes into the 'documents'
+ * bucket — uploadDocumentFile (compressed Files, browser client) and
+ * uploadDocumentBlob (raw blobs, any client) both funnel through this.
+ * Never throws — returns false and logs on failure.
+ */
+async function putDocumentBytes(
+  client: StorageCapableClient,
+  path: string,
+  body: File | Blob | Buffer,
+  contentType: string | undefined,
+): Promise<boolean> {
+  try {
+    const { error } = await client.storage
+      .from(DOCUMENTS_BUCKET)
+      .upload(path, body, { contentType, upsert: false });
+    if (error) {
+      console.warn(`[storage-upload] Storage upload failed for ${path}:`, error.message);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn(`[storage-upload] putDocumentBytes failed for ${path}:`, err);
+    return false;
+  }
+}
+
 /**
  * Compresses (if an image) and uploads a file to the 'documents' Storage
  * bucket at `${pathWithoutExt}.${ext}` (extension resolved from the
@@ -112,6 +201,11 @@ export function assertPersistableDocumentUrl(value: string | null | undefined): 
  * the final File (for callers that also need its post-compression
  * name/size/type). Never throws — returns null and logs on any failure, so
  * a failed upload never fails whatever the caller is attaching it to.
+ *
+ * Browser-only (compressImageFile uses canvas/createImageBitmap) — always
+ * uploads via the browser client. For a server-side upload with no DOM
+ * available, or a small blob that doesn't need compression (a signature),
+ * use uploadDocumentBlob instead.
  */
 export async function uploadDocumentFile(
   pathWithoutExt: string,
@@ -122,18 +216,34 @@ export async function uploadDocumentFile(
     const ext = MIME_EXT[uploadFile.type] ?? (uploadFile.name.split('.').pop() || 'bin');
     const path = `${pathWithoutExt}.${ext}`;
 
-    const supabase = getSupabaseBrowserClient();
-    const { error } = await supabase.storage
-      .from(DOCUMENTS_BUCKET)
-      .upload(path, uploadFile, { contentType: uploadFile.type || undefined, upsert: false });
-    if (error) {
-      console.warn(`[storage-upload] Storage upload failed for ${path}:`, error.message);
-      return null;
-    }
+    const ok = await putDocumentBytes(getSupabaseBrowserClient(), path, uploadFile, uploadFile.type || undefined);
+    if (!ok) return null;
 
     return { path, file: uploadFile };
   } catch (err) {
     console.warn(`[storage-upload] uploadDocumentFile failed for ${pathWithoutExt}:`, err);
     return null;
   }
+}
+
+/**
+ * Uploads a raw blob/buffer to the 'documents' bucket with no compression
+ * step — for small, already-final content like a signature PNG, where
+ * running it through compressImageFile's canvas pipeline would be both
+ * unnecessary and (server-side) impossible, since there's no DOM. Takes the
+ * caller's own client explicitly (see StorageCapableClient) so a
+ * service-role server route can upload without ever touching browser
+ * session state. Returns the resulting path, or null on failure — never
+ * throws.
+ */
+export async function uploadDocumentBlob(
+  client: StorageCapableClient,
+  pathWithoutExt: string,
+  body: Blob | Buffer,
+  contentType: string,
+): Promise<string | null> {
+  const ext = MIME_EXT[contentType] ?? 'bin';
+  const path = `${pathWithoutExt}.${ext}`;
+  const ok = await putDocumentBytes(client, path, body, contentType);
+  return ok ? path : null;
 }

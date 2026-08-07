@@ -38,6 +38,7 @@
  */
 import { NextResponse } from 'next/server';
 import { createSupabaseServerClient } from '@/lib/supabase-server';
+import { assertPersistableDocumentUrl, genUuid, uploadDocumentBlob } from '@/lib/storage-upload';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -51,6 +52,21 @@ interface SignBody {
 interface LinkRow {
   lead_id: string;
   status: string;
+  organization_id: string | null;
+}
+
+/** Parses a `data:<mime>;base64,<payload>` URL into raw bytes — no `fetch`
+ *  dependency (Node's data: URL support varies by version), just a regex
+ *  and Buffer, both guaranteed in this route's Node.js runtime. */
+function decodeDataUrl(dataUrl: string): { buffer: Buffer; contentType: string } | null {
+  const match = /^data:([a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(dataUrl);
+  if (!match) return null;
+  const [, contentType, base64] = match;
+  try {
+    return { buffer: Buffer.from(base64, 'base64'), contentType };
+  } catch {
+    return null;
+  }
 }
 
 export async function POST(
@@ -74,7 +90,7 @@ export async function POST(
 
   const { data: linkData, error: linkFetchError } = await supabase
     .from('remote_aob_links')
-    .select('lead_id, status')
+    .select('lead_id, status, organization_id')
     .eq('token', token)
     .maybeSingle();
   if (linkFetchError || !linkData) {
@@ -93,10 +109,28 @@ export async function POST(
     if (!signatureDataUrl) {
       return NextResponse.json({ error: 'A signature is required.' }, { status: 400 });
     }
+    if (!link.organization_id) {
+      return NextResponse.json({ error: 'Signing link has no organization on file.' }, { status: 500 });
+    }
+    const decoded = decodeDataUrl(signatureDataUrl);
+    if (!decoded) {
+      return NextResponse.json({ error: 'Invalid signature data.' }, { status: 400 });
+    }
+
+    // Uploads via the same service-role `supabase` client already in scope
+    // above — never getSupabaseBrowserClient(), which would try to attach
+    // browser session state that doesn't exist for an anonymous signer.
+    const pathWithoutExt = `${link.organization_id}/remote-aob/${token}/signature-${genUuid()}`;
+    const signaturePath = await uploadDocumentBlob(supabase, pathWithoutExt, decoded.buffer, decoded.contentType);
+    if (!signaturePath) {
+      return NextResponse.json({ error: 'Failed to upload signature.' }, { status: 500 });
+    }
+    assertPersistableDocumentUrl(signaturePath);
+
     const now = new Date().toISOString();
     const { error: signError } = await supabase
       .from('remote_aob_links')
-      .update({ status: 'SIGNED', signature_url: signatureDataUrl, signed_at: now })
+      .update({ status: 'SIGNED', signature_url: signaturePath, signed_at: now })
       .eq('token', token)
       .eq('status', 'PENDING');
     if (signError) {

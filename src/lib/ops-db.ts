@@ -8,6 +8,8 @@
  */
 import { getSupabaseBrowserClient } from './supabase';
 import { executeDBOperation } from './db-guard';
+import { getCurrentProfile } from './auth';
+import { assertPersistableDocumentUrl, genUuid, uploadDocumentFile } from '@/lib/storage-upload';
 import {
   categoryForGateType,
   type AuditLogEntry,
@@ -163,12 +165,40 @@ export interface MarkReceivedInput {
   receivedAt?: string;
 }
 
+/**
+ * Uploads a part's invoice file to the 'documents' bucket, at the
+ * {org}/repair-orders/{ro_id}/invoice-{uuid}.{ext} path segment reserved in
+ * 20260806000000. Returns the resulting path, or null on failure — never
+ * throws, matching every other write in this file. parts_line_items has no
+ * organization_id column (it's keyed by claim_number, not org), so the org
+ * is resolved client-side — same reasoning as rental-db.ts's
+ * uploadLoanDriverDocument: the documents bucket's write RLS keys off the
+ * first path segment matching the current session's org, so the path needs
+ * one from somewhere.
+ */
+export async function uploadPartInvoice(roId: string, file: File): Promise<string | null> {
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const profile = await getCurrentProfile(supabase);
+    if (!profile?.organizationId) return null;
+    const pathWithoutExt = `${profile.organizationId}/repair-orders/${roId}/invoice-${genUuid()}`;
+    const uploaded = await uploadDocumentFile(pathWithoutExt, file);
+    return uploaded?.path ?? null;
+  } catch (err) {
+    console.warn(`[ops-db] uploadPartInvoice failed for RO ${roId}:`, err);
+    return null;
+  }
+}
+
 /** Marks a line item RECEIVED, capturing invoice details and clearing any
- *  prior discrepancy. */
+ *  prior discrepancy. Rejects a blob:/data: invoiceUrl outright — see
+ *  assertPersistableDocumentUrl — rather than storing a reference that's
+ *  already dead by the time anyone reads it back. */
 export async function markPartReceived(
   id: string,
   input: MarkReceivedInput,
 ): Promise<{ error: string | null }> {
+  assertPersistableDocumentUrl(input.invoiceUrl);
   const supabase = getSupabaseBrowserClient();
   const { error } = await supabase
     .from(TABLE)

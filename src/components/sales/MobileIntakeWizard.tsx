@@ -28,7 +28,8 @@ import { getCurrentProfile } from '@/lib/auth';
 import { getSupabaseBrowserClient } from '@/lib/supabase';
 import { genUuid } from '@/lib/storage-upload';
 import { CarrierTierBadge } from '@/components/carrier/CarrierTierBadge';
-import { getCarrierIntel, CHECKLIST_ITEM_LABEL, type ChecklistItemId } from '@/lib/carrier-intel';
+import { CarrierPicker } from './CarrierPicker';
+import { getCarrierIntel, isDefaultCarrierIntel, CHECKLIST_ITEM_LABEL, type ChecklistItemId } from '@/lib/carrier-intel';
 import { resolveRentalOperator, type RentalOperatorBinding } from '@/lib/agreement-engine';
 import { SignaturePad } from './SignaturePad';
 import { AobAgreementText } from './AobAgreementText';
@@ -740,7 +741,7 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
               )}
               <div className="grid grid-cols-2 gap-2">
                 <input className={input} placeholder="Claim #" value={claimNumber} onChange={(e) => setClaimNumber(e.target.value)} />
-                <input className={input} placeholder="Insurance carrier" value={insuranceCarrier} onChange={(e) => setInsuranceCarrier(e.target.value)} />
+                <CarrierPicker value={insuranceCarrier} onChange={setInsuranceCarrier} className={input} />
               </div>
               <CarrierTierBadge carrier={insuranceCarrier} showHint />
               {insuranceCarrier.trim() && (
@@ -905,10 +906,18 @@ export function MobileIntakeWizard({ onClose, onComplete }: MobileIntakeWizardPr
                   <p className="font-mono text-[11px] uppercase tracking-wider text-amber-300">
                     Carrier-Required Documentation
                   </p>
-                  <p className="text-[11px] text-zinc-500">
-                    {insuranceCarrier || 'This carrier'} flags claims for scrutiny — capture these
-                    when possible.
-                  </p>
+                  {isDefaultCarrierIntel(insuranceCarrier) ? (
+                    <p className="text-[11px] text-amber-300">
+                      {insuranceCarrier.trim()
+                        ? `"${insuranceCarrier.trim()}" isn't one of our known carriers — using`
+                        : 'No carrier selected — using'}{' '}
+                      the default checklist, not a carrier-specific one.
+                    </p>
+                  ) : (
+                    <p className="text-[11px] text-zinc-500">
+                      {insuranceCarrier} flags claims for scrutiny — capture these when possible.
+                    </p>
+                  )}
                   {carrierChecklist.some((kind) => !isDocCaptured(kind)) && (
                     <p className="rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1.5 text-[11px] text-red-200">
                       ⚠ Missing: {carrierChecklist
@@ -1638,6 +1647,7 @@ function CarrierIntelBadge({ carrier }: { carrier: string }) {
     >
       {intel.lowballFlag ? '⚠ Lowball risk' : 'Standard risk'} · {intel.riskProfile}
       {intel.supplementFlag && ' · Expect supplement'}
+      {isDefaultCarrierIntel(carrier) && ' · Default'}
     </div>
   );
 }

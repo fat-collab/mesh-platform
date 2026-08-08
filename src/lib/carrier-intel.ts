@@ -107,3 +107,32 @@ export function getCarrierIntel(carrier: string): CarrierIntel {
   const key = Object.keys(CARRIER_INTEL).find((k) => n.includes(k));
   return key ? CARRIER_INTEL[key] : DEFAULT_INTEL;
 }
+
+/**
+ * True when `carrier` doesn't resolve to a specific carrier's intel and
+ * DEFAULT_INTEL is what getCarrierIntel actually returned — covers both an
+ * empty/unselected carrier and free text (a typo, or a deliberate "Other")
+ * that doesn't match anything in CARRIER_INTEL. Every carrier-checklist UI
+ * should use this to say so plainly rather than presenting DEFAULT_INTEL's
+ * generic checklist as if it were that carrier's real requirements.
+ */
+export function isDefaultCarrierIntel(carrier: string): boolean {
+  return getCarrierIntel(carrier) === DEFAULT_INTEL;
+}
+
+/**
+ * Canonical display names for every carrier CARRIER_INTEL knows about — the
+ * single source for any carrier picker in the app. Each name lowercases to
+ * exactly one CARRIER_INTEL key, so picking one here always resolves to that
+ * carrier's real intel, never DEFAULT_INTEL.
+ */
+export const KNOWN_CARRIERS: readonly string[] = [
+  'State Farm',
+  'Progressive',
+  'Allstate',
+  'USAA',
+  'GEICO',
+  'Farmers',
+  'Nationwide',
+  'Liberty Mutual',
+];

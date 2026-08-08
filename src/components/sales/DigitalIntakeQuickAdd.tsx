@@ -15,7 +15,8 @@ import { clsx } from 'clsx';
 import { createDigitalLead } from '@/lib/sales-db';
 import { importEstimateLineItems } from '@/lib/ops-db';
 import { parseEstimate } from '@/lib/estimate-parser';
-import { getCarrierIntel, CHECKLIST_ITEM_LABEL, type ChecklistItemId } from '@/lib/carrier-intel';
+import { getCarrierIntel, isDefaultCarrierIntel, CHECKLIST_ITEM_LABEL, type ChecklistItemId } from '@/lib/carrier-intel';
+import { CarrierPicker } from './CarrierPicker';
 import {
   STORM_SEVERITY_LABEL,
   STORM_SEVERITY_ORDER,
@@ -358,11 +359,7 @@ export function DigitalIntakeQuickAdd({ onClose, onComplete }: DigitalIntakeQuic
           <div className="grid grid-cols-2 gap-2">
             <div>
               <label className={labelCls}>Insurance carrier</label>
-              <input
-                value={insuranceCarrier}
-                onChange={(e) => setInsuranceCarrier(e.target.value)}
-                className={inputCls}
-              />
+              <CarrierPicker value={insuranceCarrier} onChange={setInsuranceCarrier} className={inputCls} />
             </div>
             <div>
               <label className={labelCls}>Claim number</label>
@@ -378,6 +375,7 @@ export function DigitalIntakeQuickAdd({ onClose, onComplete }: DigitalIntakeQuic
             <div className={clsx('rounded-md border px-2 py-1 text-[11px] font-medium', RISK_TONE[carrierIntel.riskProfile])}>
               {carrierIntel.lowballFlag ? '⚠ Lowball risk' : 'Standard risk'} · {carrierIntel.riskProfile}
               {carrierIntel.supplementFlag && ' · Expect supplement'}
+              {isDefaultCarrierIntel(insuranceCarrier) && ' · Default'}
             </div>
           )}
 
@@ -442,10 +440,18 @@ export function DigitalIntakeQuickAdd({ onClose, onComplete }: DigitalIntakeQuic
               <p className="font-mono text-[11px] uppercase tracking-wider text-amber-300">
                 Carrier-Required Documentation
               </p>
-              <p className="text-[11px] text-zinc-500">
-                {insuranceCarrier || 'This carrier'} flags claims for scrutiny — capture these before
-                proceeding.
-              </p>
+              {isDefaultCarrierIntel(insuranceCarrier) ? (
+                <p className="text-[11px] text-amber-300">
+                  {insuranceCarrier.trim()
+                    ? `"${insuranceCarrier.trim()}" isn't one of our known carriers — using`
+                    : 'No carrier selected — using'}{' '}
+                  the default checklist, not a carrier-specific one.
+                </p>
+              ) : (
+                <p className="text-[11px] text-zinc-500">
+                  {insuranceCarrier} flags claims for scrutiny — capture these before proceeding.
+                </p>
+              )}
               {carrierChecklist.map((kind) =>
                 kind === 'FOUR_CORNER_PHOTOS' ? (
                   <label key={kind} className="block">

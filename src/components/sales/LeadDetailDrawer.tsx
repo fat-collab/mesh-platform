@@ -23,7 +23,8 @@ import {
 import { getSignedDocumentUrls } from '@/lib/storage-upload';
 import { getCurrentProfile } from '@/lib/auth';
 import { getSupabaseBrowserClient } from '@/lib/supabase';
-import { getCarrierIntel, CHECKLIST_ITEM_LABEL } from '@/lib/carrier-intel';
+import { getCarrierIntel, isDefaultCarrierIntel, CHECKLIST_ITEM_LABEL } from '@/lib/carrier-intel';
+import { CarrierPicker } from './CarrierPicker';
 import {
   DAMAGE_TYPE_LABEL,
   type DamageType,
@@ -518,11 +519,7 @@ export function LeadDetailDrawer({ lead, onClose, onSaved }: LeadDetailDrawerPro
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className={labelCls}>Insurance carrier</label>
-              <input
-                className={inputCls}
-                value={insuranceCarrier}
-                onChange={(e) => setInsuranceCarrier(e.target.value)}
-              />
+              <CarrierPicker value={insuranceCarrier} onChange={setInsuranceCarrier} className={inputCls} />
             </div>
             <div>
               <label className={labelCls}>Claim #</label>
@@ -551,10 +548,19 @@ export function LeadDetailDrawer({ lead, onClose, onSaved }: LeadDetailDrawerPro
                   <p className="font-mono text-[11px] uppercase tracking-wider text-amber-300">
                     Carrier-Required Documentation
                   </p>
-                  <p className="text-[11px] text-zinc-500">
-                    {insuranceCarrier || 'This carrier'} flags claims for scrutiny — capture these
-                    before converting to a repair order.
-                  </p>
+                  {isDefaultCarrierIntel(insuranceCarrier) ? (
+                    <p className="text-[11px] text-amber-300">
+                      {insuranceCarrier.trim()
+                        ? `"${insuranceCarrier.trim()}" isn't one of our known carriers — using`
+                        : 'No carrier selected — using'}{' '}
+                      the default checklist, not a carrier-specific one.
+                    </p>
+                  ) : (
+                    <p className="text-[11px] text-zinc-500">
+                      {insuranceCarrier} flags claims for scrutiny — capture these before converting
+                      to a repair order.
+                    </p>
+                  )}
                   {carrierChecklist.map((kind) =>
                     renderDocSlot(kind, CHECKLIST_ITEM_LABEL[kind], true),
                   )}

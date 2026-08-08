@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { resurrectAndConvertLead } from '@/lib/sales-db';
+import { reopenLead } from '@/lib/sales-db';
 import { getSupabaseBrowserClient } from '@/lib/supabase';
 
 interface LeadActionCardProps {
@@ -24,7 +24,7 @@ export function LeadActionCard({
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  const isTerminated = leadStatus === 'CANCELLED' || leadStatus === 'LOST_TO_COMPETITOR';
+  const isTerminated = leadStatus === 'LOST';
   const isConverted = leadStatus === 'CONVERTED';
   const isReadyToConvert = hasClaim && isSigned && !isTerminated && !isConverted;
 
@@ -55,16 +55,18 @@ export function LeadActionCard({
     }
   };
 
-  // Terminated-lead path: revive + convert (stays on the board, refetches).
-  const handleResurrection = async () => {
+  // Terminated-lead path: reopen only (status -> CONTACTED, reason cleared).
+  // Converting is a separate, later step through the same Convert button
+  // above, once the lead is actually ready — no different from any other
+  // lead's path onto the shop floor.
+  const handleReopen = async () => {
     setIsLoading(true);
     setErrorMessage(null);
     try {
-      const result = await resurrectAndConvertLead(leadId);
-      if (result.success) onStatusChange?.();
-      else setErrorMessage(result.error || 'Resurrection failed.');
+      await reopenLead(leadId);
+      onStatusChange?.();
     } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : 'Resurrection failed.');
+      setErrorMessage(err instanceof Error ? err.message : 'Failed to reopen lead.');
     } finally {
       setIsLoading(false);
     }
@@ -81,11 +83,11 @@ export function LeadActionCard({
       {isTerminated ? (
         <button
           type="button"
-          onClick={handleResurrection}
+          onClick={handleReopen}
           disabled={isLoading}
           className="w-full py-2 px-4 rounded font-semibold text-sm bg-emerald-600 hover:bg-emerald-500 text-white transition disabled:opacity-50"
         >
-          {isLoading ? 'Resurrecting…' : 'Resurrect & Convert'}
+          {isLoading ? 'Reopening…' : 'Reopen'}
         </button>
       ) : isConverted ? (
         <button

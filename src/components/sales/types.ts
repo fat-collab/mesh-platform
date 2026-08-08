@@ -5,16 +5,43 @@
  * funnel (lead → estimate → approval) before a lead converts into an Ops RO.
  */
 
-export type LeadStatus =
-  | 'NEW'
-  | 'CONTACTED'
-  | 'ESTIMATE_SENT'
-  | 'AOB_SIGNED'
-  | 'APPROVED'
-  | 'CONVERTED'
-  | 'LOST'
+export type LeadStatus = 'NEW' | 'CONTACTED' | 'AOB_SIGNED' | 'CONVERTED' | 'LOST';
+
+/** Selectable from the board's status control — everything except CONVERTED
+ *  (display-only, the result of the Convert action, never chosen directly)
+ *  and LOST (requires a lost_reason, set via the dedicated lost-reason flow
+ *  rather than a plain status update). */
+export type SelectableLeadStatus = Exclude<LeadStatus, 'CONVERTED' | 'LOST'>;
+
+/** Fixed set of reasons a lead can be marked LOST — not free text, so it
+ *  never regresses to the 'DEAD - GHOSTED'-style embedded-reason strings
+ *  the status column itself used to carry. Extend by migration only, same
+ *  pattern as IntakeDocKind. */
+export type LostReason =
   | 'LOST_TO_COMPETITOR'
-  | 'CANCELLED';
+  | 'CUSTOMER_CANCELLED'
+  | 'PRICE'
+  | 'NO_RESPONSE'
+  | 'OUT_OF_SCOPE'
+  | 'OTHER';
+
+export const LOST_REASON_LABEL: Record<LostReason, string> = {
+  LOST_TO_COMPETITOR: 'Lost to competitor',
+  CUSTOMER_CANCELLED: 'Customer cancelled',
+  PRICE: 'Price',
+  NO_RESPONSE: 'No response',
+  OUT_OF_SCOPE: 'Out of scope',
+  OTHER: 'Other',
+};
+
+export const LOST_REASON_ORDER: readonly LostReason[] = [
+  'LOST_TO_COMPETITOR',
+  'CUSTOMER_CANCELLED',
+  'PRICE',
+  'NO_RESPONSE',
+  'OUT_OF_SCOPE',
+  'OTHER',
+];
 
 export interface IntakeLead {
   id: string;
@@ -28,6 +55,9 @@ export interface IntakeLead {
   insuranceCarrier: string;
   claimNumber: string;
   status: LeadStatus;
+  /** Why a LOST lead was lost — set together with status when marking a
+   *  lead LOST, cleared on reopen. Absent for any non-LOST status. */
+  lostReason?: LostReason;
   /** ISO timestamp the lead was taken in. */
   intakeDate: string;
   estimatedAmount: number;
@@ -168,25 +198,17 @@ export const STORM_SEVERITY_LABEL: Record<StormSeverity, string> = {
 export const LEAD_STATUS_ORDER: readonly LeadStatus[] = [
   'NEW',
   'CONTACTED',
-  'ESTIMATE_SENT',
   'AOB_SIGNED',
-  'APPROVED',
   'CONVERTED',
   'LOST',
-  'LOST_TO_COMPETITOR',
-  'CANCELLED',
 ];
 
 export const LEAD_STATUS_LABEL: Record<LeadStatus, string> = {
   NEW: 'New',
   CONTACTED: 'Contacted',
-  ESTIMATE_SENT: 'Estimate Sent',
-  AOB_SIGNED: 'AOB Signed',
-  APPROVED: 'Approved',
+  AOB_SIGNED: 'Signed',
   CONVERTED: 'Converted',
   LOST: 'Lost',
-  LOST_TO_COMPETITOR: 'Lost — Competitor',
-  CANCELLED: 'Cancelled',
 };
 
 // ---------------------------------------------------------------------------

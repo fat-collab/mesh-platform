@@ -20,15 +20,10 @@
  * by design (same posture as the signing page and remote_aob_links' own
  * RLS); uses a service-role client, so every input is treated as hostile.
  *
- * NOT done here, deliberately out of scope for this route: the auto-convert-
- * to-RO business rule (maybeAutoConvertOnAobSigned, in sales-db.ts) that
- * fires when updateLeadStatus's browser-client version runs. That function
- * is private and always resolves its own browser client internally — it
- * isn't built to accept an injected server client the way convertLeadToRO
- * now is, and extending it is a separate change. A remotely-signed lead
- * advances to AOB_SIGNED correctly and atomically via this route; it will
- * NOT auto-convert into a repair order the way the on-site wizard path
- * still does. Flagging this as a known gap, not silently dropping it.
+ * Conversion to a Repair Order is explicit-only (the rep presses Convert) —
+ * this route only ever advances the lead to AOB_SIGNED, same as every other
+ * path that can set that status. It never creates a vehicles/repair_orders
+ * row itself.
  *
  * Body: { signatureDataUrl: string }
  * 200: { success: true }
@@ -153,7 +148,7 @@ export async function POST(
   }
   const leadStatus = (leadData as { status: string }).status;
 
-  if (leadStatus === 'NEW' || leadStatus === 'CONTACTED' || leadStatus === 'ESTIMATE_SENT') {
+  if (leadStatus === 'NEW' || leadStatus === 'CONTACTED') {
     const { error: statusError } = await supabase
       .from('intake_leads')
       .update({ status: 'AOB_SIGNED' })

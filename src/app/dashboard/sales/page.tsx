@@ -9,11 +9,9 @@
  *  - Field Agent Dispatch: leads captured on-site via the mobile intake
  *    wizard, tracking field estimators deployed to customer residences.
  *
- * Each tab is presented through the same 4 streamlined pipeline stages (New
- * Inquiries -> Triage & Routing -> Agreement Signed / AOB Executed ->
- * Fulfilled), a presentation-layer grouping of the underlying LeadStatus.
- * Closed leads (Lost / Lost to Competitor / Cancelled) stay in a separate
- * toggled panel.
+ * Each tab is presented through 4 columns driven directly by LeadStatus (New,
+ * Contacted, Signed, Converted). Closed (Lost) leads stay in a separate
+ * toggled panel — LOST isn't a board column.
  *
  * Backed by sales-db with a local fallback so the board always renders.
  */
@@ -22,10 +20,12 @@ import { clsx } from 'clsx';
 import {
   LEAD_CHANNEL_LABEL,
   LEAD_STATUS_LABEL,
+  LOST_REASON_LABEL,
   STORM_SEVERITY_LABEL,
   type IntakeLead,
   type LeadChannel,
   type LeadStatus,
+  type SelectableLeadStatus,
   type StormSeverity,
 } from '@/components/sales/types';
 import { getLeads, updateLeadStatus } from '@/lib/sales-db';
@@ -42,59 +42,27 @@ import { LeadOwnerChip } from '@/components/sales/LeadOwnerChip';
 import { LeadDetailDrawer } from '@/components/sales/LeadDetailDrawer';
 import { LoanerReserveButton } from '@/components/sales/LoanerReserveButton';
 import { CommissionPanel } from '@/components/sales/CommissionPanel';
+import { LostReasonModal } from '@/components/sales/LostReasonModal';
 
-/** The 4 streamlined pipeline gates shown on each tab's board. */
-type SalesColumn = 'NEW_INQUIRIES' | 'TRIAGE_ROUTING' | 'AGREEMENT_SIGNED' | 'FULFILLED';
+/** A status that gets its own board column — every LeadStatus except LOST,
+ *  which lives in the separate Closed panel instead (see closedLeads). */
+type BoardStatus = Exclude<LeadStatus, 'LOST'>;
 
-const COLUMN_ORDER: SalesColumn[] = [
-  'NEW_INQUIRIES',
-  'TRIAGE_ROUTING',
-  'AGREEMENT_SIGNED',
-  'FULFILLED',
-];
+const COLUMN_ORDER: readonly BoardStatus[] = ['NEW', 'CONTACTED', 'AOB_SIGNED', 'CONVERTED'];
 
-const COLUMN_LABEL: Record<SalesColumn, string> = {
-  NEW_INQUIRIES: 'New Inquiries',
-  TRIAGE_ROUTING: 'Triage & Routing',
-  AGREEMENT_SIGNED: 'Agreement Signed / AOB Executed',
-  FULFILLED: 'Fulfilled',
+const COLUMN_TONE: Record<BoardStatus, { text: string; bar: string }> = {
+  NEW: { text: 'text-sky-300', bar: 'bg-sky-500' },
+  CONTACTED: { text: 'text-amber-300', bar: 'bg-amber-500' },
+  AOB_SIGNED: { text: 'text-cyan-300', bar: 'bg-cyan-500' },
+  CONVERTED: { text: 'text-teal-300', bar: 'bg-teal-500' },
 };
 
-const COLUMN_TONE: Record<SalesColumn, { text: string; bar: string }> = {
-  NEW_INQUIRIES: { text: 'text-sky-300', bar: 'bg-sky-500' },
-  TRIAGE_ROUTING: { text: 'text-amber-300', bar: 'bg-amber-500' },
-  AGREEMENT_SIGNED: { text: 'text-cyan-300', bar: 'bg-cyan-500' },
-  FULFILLED: { text: 'text-teal-300', bar: 'bg-teal-500' },
-};
+const TERMINAL_STATUSES: readonly LeadStatus[] = ['LOST'];
 
-const TERMINAL_STATUSES: readonly LeadStatus[] = ['LOST', 'LOST_TO_COMPETITOR', 'CANCELLED'];
-
-/**
- * The canonical LeadStatus each stage's dropdown option sets. Two legacy
- * granular values fold into each of TRIAGE_ROUTING (CONTACTED / ESTIMATE_SENT)
- * and AGREEMENT_SIGNED (AOB_SIGNED / APPROVED) — the card's stage select only
- * offers the canonical one going forward, so re-selecting a stage on an old
- * lead naturally retires the finer state without a data migration.
- */
-const STAGE_STATUS: Record<SalesColumn, LeadStatus> = {
-  NEW_INQUIRIES: 'NEW',
-  TRIAGE_ROUTING: 'CONTACTED',
-  AGREEMENT_SIGNED: 'AOB_SIGNED',
-  FULFILLED: 'CONVERTED',
-};
-
-/** Maps a granular LeadStatus onto its streamlined stage (or null for a
- *  terminal/closed status). Presentation-only — LeadStatus is unchanged.
- *  FULFILLED is reached only via CONVERTED now — MESH is shop-only, so a
- *  lead can no longer be fulfilled by a mobile dispatch completing without
- *  ever producing a repair order. */
-function statusToStage(status: LeadStatus): SalesColumn | null {
-  if (TERMINAL_STATUSES.includes(status)) return null;
-  if (status === 'CONVERTED') return 'FULFILLED';
-  if (status === 'AOB_SIGNED' || status === 'APPROVED') return 'AGREEMENT_SIGNED';
-  if (status === 'CONTACTED' || status === 'ESTIMATE_SENT') return 'TRIAGE_ROUTING';
-  return 'NEW_INQUIRIES';
-}
+/** Statuses a rep can pick from the dropdown — excludes CONVERTED (display-
+ *  only, set only by the explicit Convert action) and LOST (its own control,
+ *  requires a reason — see LostReasonModal). */
+const SELECTABLE_ORDER: readonly SelectableLeadStatus[] = ['NEW', 'CONTACTED', 'AOB_SIGNED'];
 
 const HUB_TABS: { id: LeadChannel; label: string }[] = [
   { id: 'DIGITAL_INBOUND', label: LEAD_CHANNEL_LABEL.DIGITAL_INBOUND },
@@ -141,18 +109,13 @@ function LeadCard({
 }: {
   lead: IntakeLead;
   stageByClaim: Map<string, RoStage>;
-  onMove: (id: string, status: LeadStatus) => void;
+  onMove: (id: string, status: SelectableLeadStatus) => void;
   onRefetch: () => void;
   onOpenDetail: (lead: IntakeLead) => void;
 }) {
+  const [showLostModal, setShowLostModal] = useState(false);
   const productionStage = lead.status === 'CONVERTED' ? stageByClaim.get(lead.claimNumber) : undefined;
   const productionMeta = productionStage ? STAGE_META[productionStage] : null;
-
-  // The stage select only offers the 4 canonical stage statuses (+ Closed) —
-  // a lead already sitting in a folded legacy status (ESTIMATE_SENT,
-  // APPROVED) still needs its dropdown to show the matching stage selected.
-  const currentStage = statusToStage(lead.status);
-  const statusSelectValue: LeadStatus = currentStage ? STAGE_STATUS[currentStage] : lead.status;
 
   return (
     <div className="rounded-lg border border-zinc-700/70 bg-zinc-800/80 p-3 text-left shadow-sm transition-colors duration-200">
@@ -251,34 +214,56 @@ function LeadCard({
       <LeadOwnerChip leadId={lead.id} staffName={lead.assignedStaffName} onAssigned={onRefetch} />
 
       <div className="mt-2">
-        <select
-          value={statusSelectValue}
-          onChange={(e) => onMove(lead.id, e.target.value as LeadStatus)}
-          aria-label={`Status for ${lead.customerName}`}
-          className="w-full rounded-md border border-zinc-700 bg-zinc-950/70 px-1.5 py-1 text-[11px] font-medium text-zinc-200 focus:border-sky-500/60 focus:outline-none focus:ring-1 focus:ring-sky-500/40"
-        >
-          {COLUMN_ORDER.map((c) => (
-            <option key={c} value={STAGE_STATUS[c]} className="bg-zinc-900">
-              {COLUMN_LABEL[c]}
-            </option>
-          ))}
-          <optgroup label="Closed">
-            {TERMINAL_STATUSES.map((s) => (
+        {lead.status === 'CONVERTED' || lead.status === 'LOST' ? (
+          <div
+            aria-label={`Status for ${lead.customerName}`}
+            className="w-full rounded-md border border-zinc-800 bg-zinc-950/40 px-1.5 py-1 text-[11px] font-medium text-zinc-500"
+          >
+            {LEAD_STATUS_LABEL[lead.status]}
+            {lead.status === 'LOST' && lead.lostReason && (
+              <span className="text-zinc-600"> — {LOST_REASON_LABEL[lead.lostReason]}</span>
+            )}
+          </div>
+        ) : (
+          <select
+            value={lead.status}
+            onChange={(e) => {
+              const value = e.target.value as SelectableLeadStatus | 'LOST';
+              if (value === 'LOST') {
+                setShowLostModal(true);
+                return;
+              }
+              onMove(lead.id, value);
+            }}
+            aria-label={`Status for ${lead.customerName}`}
+            className="w-full rounded-md border border-zinc-700 bg-zinc-950/70 px-1.5 py-1 text-[11px] font-medium text-zinc-200 focus:border-sky-500/60 focus:outline-none focus:ring-1 focus:ring-sky-500/40"
+          >
+            {SELECTABLE_ORDER.map((s) => (
               <option key={s} value={s} className="bg-zinc-900">
                 {LEAD_STATUS_LABEL[s]}
               </option>
             ))}
-          </optgroup>
-        </select>
+            <option value="LOST" className="bg-zinc-900">
+              {LEAD_STATUS_LABEL.LOST}
+            </option>
+          </select>
+        )}
       </div>
+
+      {showLostModal && (
+        <LostReasonModal
+          lead={lead}
+          onClose={() => setShowLostModal(false)}
+          onLost={() => {
+            setShowLostModal(false);
+            onRefetch();
+          }}
+        />
+      )}
 
       <LoanerReserveButton lead={lead} onUpdated={onRefetch} />
 
-      {(lead.status === 'APPROVED' ||
-        lead.status === 'AOB_SIGNED' ||
-        lead.status === 'CONVERTED' ||
-        lead.status === 'CANCELLED' ||
-        lead.status === 'LOST_TO_COMPETITOR') && (
+      {(lead.status === 'AOB_SIGNED' || lead.status === 'CONVERTED' || lead.status === 'LOST') && (
         <div className="mt-2">
           <LeadActionCard
             leadId={lead.id}
@@ -378,14 +363,14 @@ export default function SalesIntakePage() {
     [leads, tab],
   );
 
-  // Group into the 4 streamlined columns (presentation-only) plus a separate
+  // Group directly by status into the 4 board columns, plus a separate
   // closed-leads bucket, scoped to the active hub tab.
   const byColumn = useMemo(() => {
-    const groups = {} as Record<SalesColumn, IntakeLead[]>;
+    const groups = {} as Record<BoardStatus, IntakeLead[]>;
     for (const c of COLUMN_ORDER) groups[c] = [];
     for (const lead of tabLeads) {
-      const column = statusToStage(lead.status);
-      if (column) groups[column].push(lead);
+      if (lead.status === 'LOST') continue;
+      groups[lead.status].push(lead);
     }
     return groups;
   }, [tabLeads]);
@@ -403,11 +388,8 @@ export default function SalesIntakePage() {
     [tabLeads],
   );
 
-  const moveLead = (id: string, status: LeadStatus) => {
+  const moveLead = (id: string, status: SelectableLeadStatus) => {
     setLeads((prev) => prev.map((l) => (l.id === id ? { ...l, status } : l)));
-    // Refetch after persisting: a transition to AOB_SIGNED can auto-convert
-    // the lead into an RO server-side, and the optimistic patch above doesn't
-    // know that happened.
     void updateLeadStatus(id, status).then(() => refetch());
   };
 
@@ -535,7 +517,7 @@ export default function SalesIntakePage() {
                     <header className="mb-2 flex items-center gap-2 px-1">
                       <span className={clsx('h-2 w-2 rounded-full', tone.bar)} aria-hidden />
                       <h2 className={clsx('text-sm font-semibold', tone.text)}>
-                        {COLUMN_LABEL[column]}
+                        {LEAD_STATUS_LABEL[column]}
                       </h2>
                       <span className="ml-auto rounded-full bg-zinc-800 px-2 py-0.5 text-xs font-medium tabular-nums text-zinc-400">
                         {items.length}

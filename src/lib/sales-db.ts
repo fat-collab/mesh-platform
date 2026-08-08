@@ -23,9 +23,11 @@ import type {
   LeadChannel,
   LeadStatus,
   LeadVehicle,
+  LostReason,
   PendingVehicleDocument,
   ProxyPolicyholder,
   RemoteAobStatus,
+  SelectableLeadStatus,
   StormSeverity,
 } from '@/components/sales/types';
 
@@ -50,6 +52,7 @@ export interface LeadRow {
   walkaround_notes: Record<string, unknown>;
   signature_url?: string | null;
   status: LeadStatus;
+  lost_reason?: LostReason | null;
   agreement_accepted?: boolean | null;
   assigned_staff_id?: string | null;
   assigned_staff_name?: string | null;
@@ -86,6 +89,7 @@ function rowToLead(row: LeadRow): IntakeLead {
     insuranceCarrier: row.insurance_carrier ?? '',
     claimNumber: row.claim_number ?? '',
     status: row.status,
+    lostReason: row.lost_reason ?? undefined,
     intakeDate: row.created_at,
     estimatedAmount: row.estimated_amount ?? 0,
     agreementAccepted: row.agreement_accepted ?? undefined,
@@ -707,32 +711,18 @@ async function bridgeIntakeToOps(leadId: string): Promise<string> {
 }
 
 /**
- * Auto-convert business rule, shared by every path that can put a lead into
- * AOB_SIGNED: a claim number on file means the engagement agreement being
- * signed — on-site or via a remote proxy signing link — immediately converts
- * the lead into an active Repair Order. Best-effort: a conversion failure
- * never rolls back or blocks the status/creation that triggered it.
- */
-async function maybeAutoConvertOnAobSigned(leadId: string, status: LeadStatus, claimNumber: string | undefined): Promise<void> {
-  if (status !== 'AOB_SIGNED' || !claimNumber) return;
-  try {
-    await convertLeadToRO(leadId);
-  } catch (err) {
-    console.warn(`[sales-db] auto-conversion on AOB_SIGNED failed for lead ${leadId}:`, err);
-  }
-}
-
-/**
  * Persists a mobile intake package as an active lead record: creates the
  * lead, stores its document references / signature / walkaround in the
  * session-local package store, and returns the created lead. Attempts a DB
  * insert first; falls back to local storage when the table is unavailable.
  *
  * In-Person AOB Execution Gate: a captured on-site signature creates the lead
- * directly at AOB_SIGNED (immediately triggering the auto-convert-to-RO
- * rule) rather than NEW + a flag needing a later manual status change. A
- * lead routed to a remote proxy policyholder instead (no on-site signature)
- * is created at NEW, pending the Remote AOB Execution Gate.
+ * directly at AOB_SIGNED rather than NEW + a flag needing a later manual
+ * status change. A lead routed to a remote proxy policyholder instead (no
+ * on-site signature) is created at NEW, pending the Remote AOB Execution
+ * Gate. Conversion to a Repair Order is explicit-only (the rep presses
+ * Convert) — reaching AOB_SIGNED here never creates a vehicles/repair_orders
+ * row by itself.
  */
 export async function saveIntakePackage(
   submission: IntakeSubmission,
@@ -861,7 +851,6 @@ export async function saveIntakePackage(
       `Could not open the repair order for this intake (${detail}). The lead was saved — retry to finish the handoff.`,
     );
   }
-  await maybeAutoConvertOnAobSigned(id, status, lead.claimNumber);
   return lead;
 }
 
@@ -1071,16 +1060,14 @@ export async function createQuickLead(input: QuickLeadInput): Promise<IntakeLead
 }
 
 /**
- * Updates a lead's pipeline status (DB when available, else local).
- *
- * Automated state machine: a transition INTO 'AOB_SIGNED' (the engagement
- * agreement is signed — the definitive "signed sales estimate" moment) with a
- * claim number on file automatically converts the lead into an active Repair
- * Order, mapping customer + insurance metadata into the Ops intake pipeline
- * via convertLeadToRO. Best-effort: a conversion failure never rolls back or
- * blocks the status change itself.
+ * Updates a lead's pipeline status (DB when available, else local). Takes
+ * SelectableLeadStatus, not the full LeadStatus — CONVERTED is display-only
+ * (set only by convertLeadToRO) and LOST requires a reason (set only by
+ * markLeadLost), so neither can reach the DB through this path. Purely a
+ * status write: conversion to a Repair Order is explicit-only (the rep
+ * presses Convert), never a side effect of a status change.
  */
-export async function updateLeadStatus(id: string, status: LeadStatus): Promise<void> {
+export async function updateLeadStatus(id: string, status: SelectableLeadStatus): Promise<void> {
   try {
     const supabase = getSupabaseBrowserClient();
     const { data, error } = await supabase
@@ -1093,13 +1080,34 @@ export async function updateLeadStatus(id: string, status: LeadStatus): Promise<
     /* fall through to local */
   }
   ensureSeed();
-  // Keep the local mirror in sync regardless of which path persisted the
-  // status, so downstream reads (including the lifecycle hook below) see the
-  // current value rather than a stale cached copy.
   const lead = localLeads.find((l) => l.id === id);
   if (lead) lead.status = status;
+}
 
-  await maybeAutoConvertOnAobSigned(id, status, lead?.claimNumber);
+/**
+ * Marks a lead LOST with a required reason (DB when available, else local).
+ * Status and reason are written together — a lead can never be LOST with a
+ * null reason, or carry a stale reason from a previous LOST period once
+ * reopened (see reopenLead).
+ */
+export async function markLeadLost(id: string, reason: LostReason): Promise<void> {
+  try {
+    const supabase = getSupabaseBrowserClient();
+    const { data, error } = await supabase
+      .from(LEADS_TABLE)
+      .update({ status: 'LOST', lost_reason: reason })
+      .eq('id', id)
+      .select('id');
+    if (error || !data || data.length === 0) throw error ?? new Error('no rows updated');
+  } catch {
+    /* fall through to local */
+  }
+  ensureSeed();
+  const lead = localLeads.find((l) => l.id === id);
+  if (lead) {
+    lead.status = 'LOST';
+    lead.lostReason = reason;
+  }
 }
 
 /**
@@ -1540,7 +1548,7 @@ export async function convertLeadToRO(
       // update, and that must not block RO creation.
       const { error: updateError } = await supabase
         .from(LEADS_TABLE)
-        .update({ status: 'CONVERTED', repair_order_id: roId })
+        .update({ status: 'CONVERTED', repair_order_id: roId, lost_reason: null })
         .eq('id', leadId);
       if (updateError) {
         console.warn(`[sales-db] lead status archive failed for ${leadId}:`, updateError.message);
@@ -1602,7 +1610,10 @@ export async function convertLeadToRO(
       }
 
       const localLead = localLeads.find((l) => l.id === leadId);
-      if (localLead) localLead.status = 'CONVERTED';
+      if (localLead) {
+        localLead.status = 'CONVERTED';
+        localLead.lostReason = undefined;
+      }
       return roId;
     } catch (err) {
       // The checklist gate above is a business-rule stop, not an
@@ -1621,7 +1632,10 @@ export async function convertLeadToRO(
 
   // 4. Fallback: local Ops-board bridge (when DB tables or orgs are missing).
   const localLead = localLeads.find((l) => l.id === leadId);
-  if (localLead) localLead.status = 'CONVERTED';
+  if (localLead) {
+    localLead.status = 'CONVERTED';
+    localLead.lostReason = undefined;
+  }
   const roId = await bridgeIntakeToOps(leadId);
   // Gated on assignedStaffId, not assignedStaffName — see the DB-flow branch
   // above for why. Same Server Action as the DB-flow branch, same reason
@@ -1655,31 +1669,30 @@ export async function convertLeadToRO(
 }
 
 /**
- * Revives a terminated lead (CANCELLED / LOST / LOST_TO_COMPETITOR) back into
- * the pipeline and converts it into a Production RO. Returns a result object.
+ * Reopens a LOST lead: returns it to CONTACTED and clears lost_reason, and
+ * nothing else. Conversion is a separate, explicit action (the same Convert
+ * button any other lead uses, gated on hasClaim && isSigned) — this used to
+ * be one combined "resurrect and convert" step, but that meant reopening a
+ * lead could silently create a vehicles/repair_orders row for a lead that
+ * was never actually ready, the same failure mode maybeAutoConvertOnAobSigned
+ * had. DB when available, else local.
  */
-export async function resurrectAndConvertLead(
-  leadId: string,
-): Promise<{ success: boolean; roId?: string; error?: string }> {
-  ensureSeed();
-  const lead = localLeads.find((l) => l.id === leadId);
-  if (!lead) return { success: false, error: `Lead ${leadId} not found` };
-
+export async function reopenLead(id: string): Promise<void> {
   try {
-    if (
-      lead.status === 'CANCELLED' ||
-      lead.status === 'LOST' ||
-      lead.status === 'LOST_TO_COMPETITOR'
-    ) {
-      lead.status = 'CONTACTED'; // revive before conversion
-    }
-    const organizationId = await resolveOrganizationId();
-    const roId = await convertLeadToRO(leadId, organizationId); // sets CONVERTED + bridges
-    return { success: true, roId };
-  } catch (err) {
-    return {
-      success: false,
-      error: err instanceof Error ? err.message : 'Resurrection failed',
-    };
+    const supabase = getSupabaseBrowserClient();
+    const { data, error } = await supabase
+      .from(LEADS_TABLE)
+      .update({ status: 'CONTACTED', lost_reason: null })
+      .eq('id', id)
+      .select('id');
+    if (error || !data || data.length === 0) throw error ?? new Error('no rows updated');
+  } catch {
+    /* fall through to local */
+  }
+  ensureSeed();
+  const lead = localLeads.find((l) => l.id === id);
+  if (lead) {
+    lead.status = 'CONTACTED';
+    lead.lostReason = undefined;
   }
 }
